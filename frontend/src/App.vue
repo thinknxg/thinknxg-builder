@@ -29,7 +29,7 @@ provide("sessionUser", sessionUser);
 const title = computed(() => {
 	return pageStore.activePage && route.name !== "home"
 		? `${pageStore.activePage.page_title || "Untitled"} | Builder`
-		: "Frappe Builder";
+		: "thinkNXG Builder";
 });
 
 useTitle(title);

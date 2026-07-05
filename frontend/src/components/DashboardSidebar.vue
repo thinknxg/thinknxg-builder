@@ -46,7 +46,7 @@
 										label: 'Help',
 										onClick: () => {
 											// @ts-ignore
-											window.open('https://t.me/frappebuilder');
+											window.open('https://t.me/thinknxg');
 										},
 										icon: 'lucide-info',
 									},
@@ -62,9 +62,9 @@
 									'bg-surface-base shadow-sm': open,
 								}">
 								<div class="flex w-full cursor-pointer items-center gap-2">
-									<img src="/builder_logo.png" alt="logo" class="h-7" />
+									<img src="/thinknxg_logo.png" alt="thinkNXG logo" class="h-7" />
 									<h1 class="text-md mt-[2px] font-semibold leading-5 text-gray-800 dark:text-gray-200">
-										Builder
+										thinkNXG Builder
 									</h1>
 								</div>
 								<span

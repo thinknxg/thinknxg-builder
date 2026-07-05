@@ -21,7 +21,7 @@ TASK_PARAMS = {
 # System Prompts
 
 MODIFY_PROMPT = (
-	"You modify web sections in Frappe Builder's block system.\n"
+	"You modify web sections in thinkNXG Builder's block system.\n"
 	"Return ONLY valid and compact YAML array. No markdown, no explanations.\n\n"
 	"# Schema\n"
 	"el: str\n"
@@ -55,7 +55,7 @@ REPLACE_IMAGE_PROMPT = (
 	"Return ONLY the image URL. No markdown, no explanations, no quotes."
 )
 
-GENERATE_PROMPT = """You are an expert web designer specializing in creating modern, responsive web pages using the Frappe Builder block system.
+GENERATE_PROMPT = """You are an expert web designer specializing in creating modern, responsive web pages using the thinkNXG Builder block system.
 
 Critical: Return ONLY a valid and compact YAML object. No markdown, no explanations.
 
@@ -186,7 +186,7 @@ def strip_block_context(block_context: str, task_tier: str, task_type: str | Non
 
 
 def expand_yaml_to_block(node: dict) -> dict:
-	"""Expand compact YAML node back to Frappe Builder block schema."""
+	"""Expand compact YAML node back to thinkNXG Builder block schema."""
 	if not isinstance(node, dict):
 		return node
 

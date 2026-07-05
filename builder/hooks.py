@@ -1,8 +1,8 @@
 import frappe
 
 app_name = "builder"
-app_title = "Frappe Builder"
-app_publisher = "Frappe Technologies Pvt Ltd"
+app_title = "thinkNXG Builder"
+app_publisher = "thinkNXG Technologies Pvt Ltd"
 app_description = "An easier way to build web pages for your needs!"
 app_email = "suraj@frappe.io"
 app_license = "GNU Affero General Public License v3.0"
@@ -209,8 +209,8 @@ get_website_user_home_page = (
 add_to_apps_screen = [
 	{
 		"name": "builder",
-		"logo": "/assets/builder/frontend/builder_logo.png",
-		"title": "Builder",
+		"logo": "/assets/builder/images/thinknxg_logo.png",
+		"title": "thinkNXG Builder",
 		"route": f"/{builder_path}",
 		"has_permission": "builder.api.check_app_permission",
 	}

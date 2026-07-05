@@ -2,7 +2,7 @@
 	<!-- final step: full-page template selector -->
 	<div v-if="step === 'templates'" class="flex h-screen flex-col bg-surface-base">
 		<div class="mx-auto w-full max-w-3xl px-8 pt-16">
-			<img src="/builder_logo.png" alt="Builder" class="h-8" />
+			<img src="/thinknxg_logo.png" alt="thinkNXG Builder" class="h-8" />
 		</div>
 		<div class="flex-1 overflow-hidden">
 			<TemplateGallery
@@ -17,7 +17,7 @@
 	<div v-else class="flex h-screen items-center justify-center p-5">
 		<div class="flex w-full max-w-xl flex-col gap-8">
 			<div class="flex flex-col gap-6">
-				<img src="/builder_logo.png" alt="Builder" class="h-8 self-start" />
+				<img src="/thinknxg_logo.png" alt="thinkNXG Builder" class="h-8 self-start" />
 				<div class="flex flex-col gap-2">
 					<h1 class="text-2xl font-semibold text-ink-gray-9">{{ activeQuestion.heading }}</h1>
 				</div>

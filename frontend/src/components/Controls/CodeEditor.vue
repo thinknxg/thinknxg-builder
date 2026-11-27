@@ -3,12 +3,12 @@
 		<span class="text-p-sm-medium text-ink-gray-8" v-show="label">
 			{{ label }}
 			<span v-if="isDirty" class="text-[10px] text-gray-600">●</span>
+			<slot name="label-suffix"></slot>
 		</span>
 		<div
-			:style="{
-				'min-height': height,
-			}"
-			class="flex h-[30vh] max-h-[80vh] resize-y overflow-hidden !rounded border border-outline-gray-2 bg-surface-gray-2">
+			:style="boxStyle"
+			:class="fixedHeight ? '' : 'h-[30vh]'"
+			class="flex max-h-[80vh] resize-y overflow-hidden !rounded-4 border border-outline-gray-2 bg-surface-gray-2">
 			<CodeMirrorEditor
 				ref="editor"
 				:mode
@@ -34,16 +34,19 @@
 		<Button
 			v-if="showSaveButton"
 			variant="solid"
-			@click="emit('save', editor.getEditorValue())"
+			@click="handleSave(editor.getEditorValue())"
 			class="mt-3"
 			:disabled="!isDirty || readonly">
-			Save
+			{{ __("Save") }}
 		</Button>
 	</div>
 </template>
 <script setup lang="ts">
-import { ref, VNodeRef, watch } from "vue";
-import CodeMirrorEditor from "./CodeMirror/CodeMirrorEditor.vue";
+import { __ } from "@/translation";
+import { computed, defineAsyncComponent, ref, StyleValue, VNodeRef, watch } from "vue";
+
+// keeps the CodeMirror stack out of the main editor bundle
+const CodeMirrorEditor = defineAsyncComponent(() => import("./CodeMirror/CodeMirrorEditor.vue"));
 
 const props = withDefaults(
 	defineProps<{
@@ -53,6 +56,8 @@ const props = withDefaults(
 		label?: string;
 		readonly?: boolean;
 		height?: string;
+		/** use `height` as the editor's height; otherwise it is a minimum under a 30vh box */
+		fixedHeight?: boolean;
 		showLineNumbers?: boolean;
 		autofocus?: boolean;
 		showSaveButton?: boolean;
@@ -75,10 +80,16 @@ const props = withDefaults(
 	},
 );
 
+const boxStyle = computed<StyleValue>(() =>
+	props.fixedHeight ? { height: props.height } : { minHeight: props.height },
+);
+
 const emit = defineEmits(["save", "update:modelValue"]);
 const editor = ref<VNodeRef | null>(null);
 
 const isDirty = ref(false);
+// a modelValue that only echoes what this editor emitted must not reset it, or text typed since is lost
+let pendingEcho: string | null = null;
 
 const handleBlur = (value: string) => {
 	try {
@@ -92,6 +103,7 @@ const handleBlur = (value: string) => {
 			return;
 		}
 		if (!props.showSaveButton && !props.readonly) {
+			pendingEcho = value;
 			emit("update:modelValue", processedValue);
 			isDirty.value = false; // Reset dirty state after blur save
 		}
@@ -126,6 +138,7 @@ const handleChange = (value: string) => {
 
 const handleSave = (value: string) => {
 	if (props.readonly) return;
+	pendingEcho = value;
 
 	if (props.type === "JSON" && value) {
 		value = JSON.parse(value);
@@ -153,6 +166,12 @@ function resetEditor(resetHistory = false) {
 watch(
 	() => props.modelValue,
 	() => {
+		const echoed = pendingEcho !== null && getModelValue() === pendingEcho;
+		pendingEcho = null;
+		if (echoed && editor.value) {
+			isDirty.value = editor.value.getEditorValue() !== getModelValue();
+			return;
+		}
 		resetEditor();
 	},
 );

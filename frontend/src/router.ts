@@ -1,6 +1,9 @@
 import { createResource } from "frappe-ui";
 import { ref } from "vue";
 import { NavigationGuardNext, RouteLocationNormalized, createRouter, createWebHistory } from "vue-router";
+import { __ } from "./translation";
+import { editorDemo } from "./utils/editorDemo";
+import { personaSurveyRedirect } from "./utils/personaSurvey";
 
 let hasPermission: null | boolean = null;
 let sessionUser = ref("Guest");
@@ -9,7 +12,7 @@ function validatePermission(next: NavigationGuardNext) {
 	if (hasPermission) {
 		next();
 	} else {
-		alert("You do not have permission to access this page");
+		alert(__("You do not have permission to access this page"));
 		if (isUserLoggedIn()) {
 			window.location.href = "/app";
 		} else {
@@ -45,6 +48,9 @@ const validateVisit = async function (
 	return validatePermission(next);
 };
 
+// before the dashboard renders, so a user who owes the persona survey never sees the dashboard first
+const personaSurveyFirst = (to: RouteLocationNormalized) => personaSurveyRedirect(to, sessionUser.value);
+
 function isUserLoggedIn() {
 	return document.cookie.includes("user_id") && !document.cookie.includes("user_id=Guest");
 }
@@ -67,7 +73,14 @@ const routes = [
 	{
 		path: "/",
 		name: "home",
-		beforeEnter: validateVisit,
+		beforeEnter: [validateVisit, personaSurveyFirst],
+		component: () => import("@/pages/PageBuilderDashboard.vue"),
+	},
+	{
+		path: "/dashboard/:item/:path(.*)*",
+		name: "dashboard-item",
+		// a dashboard view is the dashboard too, so a user who owes the survey goes there first
+		beforeEnter: [validateVisit, personaSurveyFirst],
 		component: () => import("@/pages/PageBuilderDashboard.vue"),
 	},
 	{
@@ -102,8 +115,13 @@ if (builder_path.startsWith("{{")) {
 }
 const router = createRouter({
 	history: createWebHistory(builder_path),
-	routes,
+	// named "builder" so the editor's own links resolve, but only to the demo's page
+	routes: editorDemo
+		? [{ path: "/demo/:pageId", name: "builder", component: () => import("@/pages/PageBuilder.vue") }]
+		: routes,
 });
+
+if (editorDemo) router.beforeEach((to) => to.params.pageId === editorDemo?.page.name);
 
 export { sessionUser };
 export default router;

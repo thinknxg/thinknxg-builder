@@ -1,51 +1,50 @@
 <template>
 	<div class="flex flex-col gap-5">
-		<div class="flex flex-col gap-3">
-			<InlineInput
-				type="autocomplete"
-				label="Homepage"
-				:showInputAsOption="true"
-				class="w-1/2"
-				:modelValue="builderSettings.doc?.home_page"
-				@update:modelValue="
-					(val) => {
+		<div class="flex gap-3">
+			<Input
+				:label="__('Homepage')"
+				:show-input-as-option="true"
+				:model-value="builderSettings.doc?.home_page"
+				:options="routeOptions"
+				@update:model-value="
+					(val: string) => {
 						builderStore.updateBuilderSettings('home_page', val);
 					}
-				"
-				:options="routeOptions"></InlineInput>
-			<InlineInput
+				"></Input>
+			<Input
 				type="text"
-				label="Language"
-				description="Default HTML lang code (e.g., en, es, fr)"
-				class="w-1/2"
+				:label="__('Language')"
+				:description="__('Default HTML lang code (e.g., en, es, fr)')"
 				placeholder="en"
-				:modelValue="builderSettings.doc?.default_language || 'en'"
-				@update:modelValue="
-					(val) => {
+				:model-value="builderSettings.doc?.default_language || 'en'"
+				@update:model-value="
+					(val: string) => {
 						builderStore.updateBuilderSettings('default_language', val);
 					}
-				"></InlineInput>
+				"></Input>
 		</div>
 		<hr class="w-full border-outline-gray-2" />
 		<div class="flex flex-col justify-between gap-5">
-			<span class="text-xl-semibold text-ink-gray-9">Favicon</span>
+			<span class="text-md-semibold text-ink-gray-9">{{ __("Favicon") }}</span>
 			<div class="flex flex-1 gap-5">
 				<div
-					class="flex items-center justify-center rounded border border-outline-gray-1 bg-surface-gray-2 px-20 py-5">
+					class="flex items-center justify-center rounded-4 border border-outline-gray-1 bg-surface-gray-2 px-20 py-5">
 					<img
 						:src="builderSettings.doc?.favicon || '/assets/builder/images/thinknxg_logo.png'"
 						alt="Site Favicon"
-						class="size-6 rounded" />
+						class="size-6 rounded-4" />
 				</div>
 				<div class="flex flex-1 flex-col gap-2">
 					<ImageUploader
-						label="Favicon"
+						:label="__('Favicon')"
 						image_type="image/ico"
 						:image_url="builderSettings.doc?.favicon"
 						@upload="(url: string) => builderStore.updateBuilderSettings('favicon', url)"
 						@remove="() => builderStore.updateBuilderSettings('favicon', '')" />
 					<span class="text-p-sm text-ink-gray-6">
-						Appears next to the title in your browser tab. Recommended size is 32x32 px in PNG or ICO
+						{{
+							__("Appears next to the title in your browser tab. Recommended size is 32x32 px in PNG or ICO")
+						}}
 					</span>
 				</div>
 			</div>
@@ -53,10 +52,10 @@
 		<hr class="w-full border-outline-gray-2" />
 		<Switch
 			size="sm"
-			label="Enable View Tracking"
-			description="Track the number of views on each page of your website"
-			:modelValue="Boolean(websiteSettings.doc?.enable_view_tracking)"
-			@update:modelValue="
+			:label="__('Enable View Tracking')"
+			:description="__('Track the number of views on each page of your website')"
+			:model-value="Boolean(websiteSettings.doc?.enable_view_tracking)"
+			@update:model-value="
 				(val: Boolean) => {
 					websiteSettings.setValue.submit({
 						enable_view_tracking: val,
@@ -65,24 +64,37 @@
 			" />
 		<Switch
 			size="sm"
-			label="Auto convert images to WebP"
-			description="All the images uploaded via Builder will be converted to WebP for better page performance"
-			:modelValue="Boolean(builderSettings.doc?.auto_convert_images_to_webp)"
-			@update:modelValue="
+			:label="__('Auto convert images to WebP')"
+			:description="
+				__('All the images uploaded via Builder will be converted to WebP for better page performance')
+			"
+			:model-value="Boolean(builderSettings.doc?.auto_convert_images_to_webp)"
+			@update:model-value="
 				(val: Boolean) => builderStore.updateBuilderSettings('auto_convert_images_to_webp', val)
 			" />
 		<Switch
 			size="sm"
-			label="Disable Auto Dark Mode"
-			description="Prevent the site from automatically switching to dark mode"
-			:modelValue="Boolean(builderSettings.doc?.disable_auto_dark_mode)"
-			@update:modelValue="
+			:label="__('Disable Auto Dark Mode')"
+			:description="__('Prevent the site from automatically switching to dark mode')"
+			:model-value="Boolean(builderSettings.doc?.disable_auto_dark_mode)"
+			@update:model-value="
 				(val: Boolean) => builderStore.updateBuilderSettings('disable_auto_dark_mode', val)
 			" />
+		<hr class="w-full border-outline-gray-2" />
+		<CodeEditor
+			:modelValue="websiteSettings.doc?.robots_txt"
+			type="Python"
+			height="120px"
+			fixed-height
+			label="robots.txt"
+			:autofocus="false"
+			:show-line-numbers="true"
+			:description="robotsDescription"
+			@update:modelValue="(val: string) => websiteSettings.setValue.submit({ robots_txt: val })" />
 	</div>
 </template>
 <script setup lang="ts">
-import InlineInput from "@/components/Controls/InlineInput.vue";
+import { __ } from "@/translation";
 import { allWebPages } from "@/data/allWebPages";
 import { builderSettings } from "@/data/builderSettings";
 import { websiteSettings } from "@/data/websiteSettings";
@@ -90,9 +102,17 @@ import useBuilderStore from "@/stores/builderStore";
 import { BuilderPage } from "@/types/doctypes";
 import { Switch } from "frappe-ui";
 import { computed } from "vue";
+import CodeEditor from "../Controls/CodeEditor.vue";
 import ImageUploader from "../Controls/ImageUploader.vue";
 
 const builderStore = useBuilderStore();
+
+const robotsGuide =
+	"https://developer.mozilla.org/en-US/docs/Web/Security/Practical_implementation_guides/Robots_txt";
+const robotsDescription = __(
+	"Specify rules to control how search engines interact with your site. For more details, visit {0}.",
+	[`<a href="${robotsGuide}">${__("Robots.txt Guide")}</a>`],
+);
 
 const routeOptions = computed(() => {
 	return allWebPages.data

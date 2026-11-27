@@ -3,13 +3,13 @@
 		<section class="m-auto mb-24 flex h-fit w-3/4 max-w-6xl flex-col pt-5">
 			<!-- pages -->
 			<div>
-				<div v-if="!webPages.data?.length && !searchFilter && !typeFilter" class="col-span-full">
+				<div v-if="!webPages.data?.length && !searchFilter && !activeFilterCount" class="col-span-full">
 					<p class="px-3 text-base text-gray-500">
-						You don't have any pages yet. Click on the "+ New" button to create a new page.
+						{{ __("You don't have any pages yet. Click on the + New button to create a new page.") }}
 					</p>
 				</div>
 				<div v-else-if="!webPages.data?.length" class="col-span-full">
-					<p class="px-3 text-base text-gray-500">No matching pages found.</p>
+					<p class="px-3 text-base text-gray-500">{{ __("No matching pages found.") }}</p>
 				</div>
 				<!-- grid -->
 				<div class="grid-col grid gap-3 auto-fill-[210px]" v-if="displayType === 'grid'">
@@ -46,24 +46,25 @@
 				v-if="webPages.data?.length && webPages.hasNextPage && displayType !== 'tree'"
 				variant="subtle"
 				size="sm">
-				Load More
+				{{ __("Load More") }}
 			</Button>
 		</section>
 	</div>
 </template>
 
 <script setup lang="ts">
+import { __ } from "@/translation";
 import PageCard from "@/components/PageCard.vue";
 import PageListItem from "@/components/PageListItem.vue";
 import RouteTreeView from "@/components/RouteTreeView.vue";
 import { useDashboardState } from "@/composables/useDashboardState";
-import { webPages } from "@/data/webPage";
+import { pagesWithUnpublishedChanges, webPages } from "@/data/webPage";
 import vOnClickAndHold from "@/directives/vOnClickAndHold";
 import useBuilderStore from "@/stores/builderStore";
 import { BuilderPage } from "@/types/doctypes";
 import { watchDebounced } from "@vueuse/core";
-import { useShortcut } from "frappe-ui";
-import { useTelemetry } from "frappe-ui/frappe";
+import { useKeyboardShortcut } from "frappe-ui";
+import { useTelemetry } from "@framework/ui/telemetry";
 import { onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from "vue";
 
 const routeTreeRef = ref<InstanceType<typeof RouteTreeView>>();
@@ -72,7 +73,10 @@ const { capture } = useTelemetry();
 const builderStore = useBuilderStore();
 const {
 	searchFilter,
-	typeFilter,
+	statusFilter,
+	accessFilter,
+	createdByFilter,
+	activeFilterCount,
 	orderBy,
 	displayType,
 	selectionMode,
@@ -84,8 +88,12 @@ const {
 onActivated(() => {
 	builderStore.realtime.doctype_subscribe("Builder Page");
 	builderStore.realtime.on("list_update", (e) => {
-		if (e.doctype == "Builder Page") fetchPages();
+		if (e.doctype !== "Builder Page") return;
+		fetchPages();
+		pagesWithUnpublishedChanges.fetch();
 	});
+	// publishing is the only thing that moves this set, so it skips the list's filters
+	pagesWithUnpublishedChanges.fetch();
 });
 
 onDeactivated(() => {
@@ -128,27 +136,43 @@ watch(
 watch(displayType, () => fetchPages());
 
 // remove selection mode when the escape key is pressed
-useShortcut({
-	key: "Escape",
-	description: "Deselect pages",
-	group: "Dashboard",
+useKeyboardShortcut({
+	combo: "Escape",
+	description: __("Deselect Pages"),
+	group: __("Dashboard"),
+	// an always-on Escape is preventDefault-ed here, which stops menus from dismissing
+	enabled: selectionMode,
 	handler: () => {
 		selectedPages.value.clear();
 		selectionMode.value = false;
 	},
 });
 
+const statusFilters: Partial<Record<typeof statusFilter.value, object>> = {
+	live: { published: 1 },
+	staging: { staging: 1 },
+	draft: { published: 0, staging: 0 },
+	// draft pages carry draft_blocks too, and search owns the OR group, so this reuses the names lookup
+	get unpublished_changes() {
+		return {
+			name: ["in", (pagesWithUnpublishedChanges.data || []).map((page: { name: string }) => page.name)],
+		};
+	},
+};
+
+const accessFilters: Partial<Record<typeof accessFilter.value, object>> = {
+	public: { authenticated_access: 0 },
+	protected: { authenticated_access: 1 },
+};
+
 const fetchPages = () => {
 	const filters = {
 		is_template: 0,
 	} as any;
-	if (typeFilter.value && displayType.value !== "tree") {
-		if (typeFilter.value === "published") {
-			filters["published"] = true;
-		} else if (typeFilter.value === "unpublished") {
-			filters["published"] = false;
-		} else if (typeFilter.value === "draft") {
-			filters["draft_blocks"] = ["is", "set"];
+	if (displayType.value !== "tree") {
+		Object.assign(filters, statusFilters[statusFilter.value], accessFilters[accessFilter.value]);
+		if (createdByFilter.value) {
+			filters["owner"] = createdByFilter.value;
 		}
 	}
 	const orFilters = {} as any;
@@ -227,7 +251,14 @@ const togglePageSelection = (page: BuilderPage) => {
 	}
 };
 
-watchDebounced([searchFilter, typeFilter, orderBy], fetchPages, {
+watch(
+	() => pagesWithUnpublishedChanges.data,
+	() => {
+		if (statusFilter.value === "unpublished_changes") fetchPages();
+	},
+);
+
+watchDebounced([searchFilter, statusFilter, accessFilter, createdByFilter, orderBy], fetchPages, {
 	debounce: 300,
 	immediate: true,
 });

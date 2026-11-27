@@ -1,6 +1,6 @@
 declare type StyleValue = string | number | boolean | null | undefined;
 
-declare type styleProperty = keyof CSSProperties | `__${string}`;
+declare type styleProperty = keyof CSSProperties | `${string}:${keyof CSSProperties}` | `__${string}`;
 
 declare interface BlockStyleMap {
 	[key: styleProperty]: StyleValue;
@@ -90,13 +90,6 @@ declare interface StyleCopy {
 	style: BlockStyleObjects;
 }
 
-declare interface ContextMenuOption {
-	label: string;
-	action: CallableFunction;
-	condition?: () => boolean;
-	disabled?: () => boolean;
-}
-
 declare interface ComponentData {
 	name: string;
 	doctype?: string;
@@ -110,7 +103,15 @@ declare type HashString = `#${string}`;
 
 declare type RGBString = `rgb(${number}, ${number}, ${number})`;
 
-declare type LeftSidebarTabOption = "Blocks" | "Layers" | "Assets" | "Code" | "variables";
+// the literals keep autocomplete; the string widens it for plugin tabs
+declare type LeftSidebarTabOption =
+	| "Blocks"
+	| "Layers"
+	| "Assets"
+	| "Code"
+	| "Chat"
+	| "variables"
+	| (string & {});
 
 declare type BuilderMode = "select" | "text" | "container" | "image" | "repeater" | "move";
 

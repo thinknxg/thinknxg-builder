@@ -1,0 +1,404 @@
+"""The model registry: Builder AI Provider / Builder AI Model rows + live metadata.
+
+Which models are offered is found, not configured in code. Providers are
+DocTypes connected from Bob's /providers menu; their models are discovered from
+each provider's own listing and kept to the frontier (builder/ai/discovery.py),
+and a gateway with its own api_base lists its models through GatewayListing
+below. A row can still be added, switched on or off by hand from the desk.
+
+Everything factual about an OpenRouter model — context window, pricing (incl.
+cache-read), vision support — is still fetched from OpenRouter's public models
+API and cached, so it never goes stale. The values stored on the row are the
+offline fallback, and the only source for every other provider.
+"""
+
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+import frappe
+import requests
+from frappe.utils.caching import redis_cache
+
+logger = frappe.logger("builder.ai.models")
+logger.setLevel(logging.INFO)
+
+CATALOG_TTL = 6 * 3600
+ROWS_TTL = 3600
+FETCH_TIMEOUT = 10
+DEFAULT_CONTEXT_WINDOW = 200_000
+# a new site starts with this in Builder Settings: the thinkNXG Cloud gateway's model
+DEFAULT_AI_MODEL = "frappe/openai/gpt-5.6-terra"
+
+# Used only when the rows are unreachable (install/migrate ordering) or all gone,
+# so the agent still has something to call.
+FALLBACK_MODEL = {
+	"name": "openrouter/anthropic/claude-sonnet-5.5",
+	"label": "Claude Sonnet 5.5",
+	"provider": "OpenRouter",
+	"route_prefix": "openrouter",
+	"litellm_provider": "openrouter",
+	"api_base": None,
+	"max_tokens": 1_000_000,
+	"vision": True,
+}
+
+
+@redis_cache(ttl=CATALOG_TTL)
+def fetch_openrouter_catalog() -> dict:
+	"""Live metadata for every OpenRouter model, keyed by our litellm-prefixed name."""
+	r = requests.get("https://openrouter.ai/api/v1/models", timeout=FETCH_TIMEOUT)
+	r.raise_for_status()
+	catalog = {}
+	for m in r.json().get("data", []):
+		modalities = (m.get("architecture") or {}).get("input_modalities") or []
+		catalog[f"openrouter/{m['id']}"] = {
+			"max_tokens": m.get("context_length"),
+			"vision": "image" in modalities,
+		}
+	return catalog
+
+
+@redis_cache(ttl=ROWS_TTL)
+def load_models() -> list[dict]:
+	"""Every enabled model, flattened with its provider's routing fields. Cached
+	because the loop asks for model facts many times per turn; both doctypes clear
+	it on update."""
+	try:
+		providers = {
+			p.name: p
+			for p in frappe.get_all(
+				"Builder AI Provider",
+				filters={"enabled": 1},
+				fields=[
+					"name",
+					"route_prefix",
+					"litellm_provider",
+					"api_base",
+				],
+				order_by="creation asc",
+			)
+		}
+		rows = frappe.get_all(
+			"Builder AI Model",
+			filters={"enabled": 1},
+			fields=[
+				"name",
+				"label",
+				"provider",
+				"supports_vision",
+				"max_tokens",
+				"frontier_rank",
+			],
+			order_by="creation asc",
+		)
+	except Exception as e:
+		logger.warning(f"AI model rows unavailable, using the built-in fallback: {e}")
+		return [dict(FALLBACK_MODEL)]
+
+	# providers in the order they were connected; within one, discovery's ranking
+	# (best first), and rows added by hand after the ranked ones
+	order = {name: i for i, name in enumerate(providers)}
+	rows = sorted(rows, key=lambda r: (order.get(r.provider, 0), r.frontier_rank or len(rows) + 1))
+	models = []
+	for row in rows:
+		provider = providers.get(row.provider)
+		if not provider:
+			continue  # a disabled provider takes its models with it
+		models.append(
+			{
+				"name": row.name,
+				"label": row.label or row.name,
+				"provider": provider.name,
+				"route_prefix": provider.route_prefix,
+				"litellm_provider": provider.litellm_provider,
+				"api_base": provider.api_base or None,
+				"max_tokens": row.max_tokens or DEFAULT_CONTEXT_WINDOW,
+				"vision": bool(row.supports_vision),
+			}
+		)
+	return models or [dict(FALLBACK_MODEL)]
+
+
+def lookup_metadata(qualified_name: str, model_id: str) -> dict:
+	"""Context window and vision support for a model, so nobody has to type them in.
+	OpenRouter models come from its catalog; everything else from litellm's own model
+	map, which knows the mainstream hosted models. An unknown model returns {} and
+	keeps whatever defaults it was given."""
+	if qualified_name.startswith("openrouter/"):
+		try:
+			if found := fetch_openrouter_catalog().get(qualified_name):
+				return {k: v for k, v in found.items() if v is not None}
+		except Exception as e:
+			logger.warning(f"OpenRouter lookup failed for {qualified_name}: {e}")
+
+	try:
+		import litellm
+
+		# the cost map directly: get_model_info raises (and logs a provider list) for
+		# every model it does not know, which is the normal case for a custom gateway
+		info = litellm.model_cost.get(model_id) or litellm.model_cost.get(model_id.split("/")[-1])
+	except Exception:
+		info = None
+	if not info:
+		return {}
+	found = {
+		"max_tokens": info.get("max_input_tokens") or info.get("max_tokens"),
+		"vision": info.get("supports_vision"),
+	}
+	return {k: v for k, v in found.items() if v is not None}
+
+
+LISTING_TTL = 5 * 60
+# Embeddings and rerankers answer /models too, and fail as chat models.
+NON_CHAT_MARKERS = ("embed", "embedding", "rerank", "reranker", "whisper", "tts", "moderation")
+
+
+class GatewayListing:
+	"""The models a gateway with its own api_base serves right now, per its /models.
+
+	Gateways add and retire models without telling anyone, so newly listed models
+	get rows as they appear, and the cached listing lets the picker hide a model
+	the gateway stopped serving instead of failing the turn that picks it."""
+
+	def __init__(self, provider):
+		self.provider = provider
+
+	@classmethod
+	def refresh_in_background(cls) -> None:
+		"""Queue a sync when any gateway's listing is stale. A slow gateway never holds up the
+		picker this way: it shows what is stored, and what changed on its next load."""
+		names = frappe.get_all(
+			"Builder AI Provider", filters={"enabled": 1, "api_base": ["is", "set"]}, pluck="name"
+		)
+		if any(frappe.cache.get_value(cls.cache_key(name)) is None for name in names):
+			frappe.enqueue(
+				sync_stale_gateways,
+				queue="short",
+				job_id="builder_ai_gateway_sync",
+				deduplicate=True,
+				enqueue_after_commit=True,
+			)
+
+	@classmethod
+	def sync_all(cls, force: bool = False) -> None:
+		"""Sync every enabled gateway whose listing is stale (or all, when forced)."""
+		names = frappe.get_all(
+			"Builder AI Provider", filters={"enabled": 1, "api_base": ["is", "set"]}, pluck="name"
+		)
+		listings = [cls(frappe.get_doc("Builder AI Provider", name)) for name in names]
+		stale = [listing for listing in listings if force or not listing.is_fresh()]
+		if not stale:
+			return
+		# side by side, so one unreachable gateway can't stall the picker for the rest
+		with ThreadPoolExecutor(max_workers=len(stale)) as pool:
+			outcomes = list(pool.map(fetch_listing, [listing.request() for listing in stale]))
+		for listing, outcome in zip(stale, outcomes, strict=True):
+			if isinstance(outcome, Exception):
+				logger.warning(f"model listing failed for {listing.provider.name}: {outcome}")
+				listing.remember(None)
+			else:
+				listing.apply(outcome)
+
+	@classmethod
+	def served_ids(cls, provider_name: str) -> set[str] | None:
+		"""Ids from the last good listing, or None when there is none to go by."""
+		cached = frappe.cache.get_value(cls.cache_key(provider_name)) or {}
+		ids = cached.get("ids")
+		return set(ids) if ids is not None else None
+
+	@staticmethod
+	def cache_key(provider_name: str) -> str:
+		return f"builder_ai_gateway_listing::{provider_name}"
+
+	def is_fresh(self) -> bool:
+		return frappe.cache.get_value(self.cache_key(self.provider.name)) is not None
+
+	def sync(self) -> dict:
+		"""Add a row for every listed chat model that has none. Existing rows are
+		left alone, so a model someone switched off stays off."""
+		outcome = fetch_listing(self.request())
+		if isinstance(outcome, Exception):
+			self.remember(None)
+			raise outcome
+		return self.apply(outcome)
+
+	def apply(self, listed: list[str]) -> dict:
+		chat = [i for i in listed if not any(m in i.lower() for m in NON_CHAT_MARKERS)]
+		self.remember(chat)
+		added = [model_id for model_id in chat if self.add_row(model_id)]
+		return {"added": added, "skipped": sorted(set(listed) - set(chat)), "found": len(listed)}
+
+	def credits(self) -> dict | None:
+		"""The balance the gateway reports at its credits_url, or None when it reports none."""
+		_, headers = self.request()
+		return fetch_credits(self.provider.credits_url, headers)
+
+	def request(self) -> tuple[str, dict]:
+		base = self.provider.api_base.rstrip("/")
+		# Never the Builder Settings key: that belongs to OpenRouter, not this api_base.
+		key = self.provider.resolved_key()
+		if self.provider.litellm_provider == "anthropic":
+			# litellm treats an Anthropic api_base as the host root and appends /v1/messages
+			return f"{base}/v1/models", {"x-api-key": key or "", "anthropic-version": "2023-06-01"}
+		return f"{base}/models", {"Authorization": f"Bearer {key}"} if key else {}
+
+	def remember(self, ids: list[str] | None) -> None:
+		frappe.cache.set_value(self.cache_key(self.provider.name), {"ids": ids}, expires_in_sec=LISTING_TTL)
+
+	def add_row(self, model_id: str) -> bool:
+		if frappe.db.exists("Builder AI Model", f"{self.provider.route_prefix}/{model_id}"):
+			return False
+		try:
+			frappe.get_doc(
+				{
+					"doctype": "Builder AI Model",
+					"provider": self.provider.name,
+					"model_id": model_id,
+					# the provider heads its group in the picker, so a vendor prefix is noise
+					"label": model_id.rsplit("/", 1)[-1],
+					"enabled": 1,
+				}
+			).insert(ignore_permissions=True)
+		except frappe.DuplicateEntryError:
+			return False
+		return True
+
+
+def sync_stale_gateways() -> None:
+	GatewayListing.sync_all()
+
+
+def fetch_listing(request: tuple[str, dict]) -> list[str] | Exception:
+	"""Model ids at a /models endpoint. Plain HTTP and no frappe calls, so it is safe in a
+	worker thread; it returns the error rather than raising, so one failure can't sink a batch."""
+	url, headers = request
+	try:
+		response = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+		response.raise_for_status()
+		return [entry["id"] for entry in response.json().get("data") or [] if (entry or {}).get("id")]
+	except Exception as e:
+		return e
+
+
+def fetch_credits(url: str, headers: dict) -> dict | None:
+	"""The balance a gateway reports at `url` as {balance, spent}, or None when it reports none."""
+	try:
+		response = requests.get(url, headers=headers, timeout=FETCH_TIMEOUT)
+		response.raise_for_status()
+		reported = response.json()
+	except Exception:
+		return None
+	if not isinstance(reported, dict) or not is_number(reported.get("balance")):
+		return None
+	spent = reported.get("spent")
+	return {"balance": reported["balance"], "spent": spent if is_number(spent) else None}
+
+
+def is_number(value) -> bool:
+	return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+class ModelRegistry:
+	@classmethod
+	def clear_cache(cls) -> None:
+		load_models.clear_cache()
+
+	@classmethod
+	def catalog(cls) -> list[dict]:
+		"""The configured models with live OpenRouter metadata merged over the
+		stored values. A failed/unreachable fetch degrades to the stored values,
+		never to an error."""
+		live = {}
+		try:
+			live = fetch_openrouter_catalog()
+		except Exception as e:
+			logger.warning(f"OpenRouter catalog fetch failed, using stored values: {e}")
+		return [
+			{**m, **{k: v for k, v in (live.get(m["name"]) or {}).items() if v is not None}}
+			for m in load_models()
+		]
+
+	@classmethod
+	def available(cls) -> list[dict]:
+		"""Provider-grouped catalog — the shape the model picker consumes.
+
+		Only models that can actually be called: their provider's own key, a
+		gateway's api_base (which may need no key), or for OpenRouter the shared one
+		in Builder Settings. A model with nothing behind it belongs to a provider
+		that isn't connected, and connecting is what /providers is for. Computed
+		here rather than in the cached row loader, so key state is never held in redis."""
+		from builder.ai.llm import provider_api_key, settings_api_key, uses_settings_key
+
+		fallback = bool(settings_api_key())
+		default = get_configured_default()
+		grouped: dict[str, list] = {}
+		for m in cls.catalog():
+			if not cls.still_served(m):
+				continue
+			if not (m.get("api_base") or provider_api_key(m) or (fallback and uses_settings_key(m))):
+				continue
+			grouped.setdefault(m["provider"], []).append(
+				{**m, "ready": True, "default": m["name"] == default}
+			)
+		return [{"provider": provider, "models": models} for provider, models in grouped.items()]
+
+	@staticmethod
+	def still_served(m: dict) -> bool:
+		served = GatewayListing.served_ids(m["provider"]) if m.get("api_base") else None
+		prefix = m.get("route_prefix") or ""
+		return served is None or m["name"][len(prefix) + 1 :] in served
+
+	@classmethod
+	def find(cls, model_name: str) -> dict | None:
+		for m in cls.catalog():
+			if m["name"] == model_name:
+				return m
+		return None
+
+	@classmethod
+	def get_label(cls, model_name: str) -> str:
+		m = cls.find(model_name)
+		if m:
+			return m["label"]
+		return model_name.split("/", 1)[-1].replace("/", " ").replace("-", " ").title()
+
+	@classmethod
+	def detect_provider(cls, model: str) -> str | None:
+		m = cls.find(model)
+		return m["provider"] if m else None
+
+	@classmethod
+	def context_window(cls, model_name: str) -> int:
+		m = cls.find(model_name)
+		return int((m or {}).get("max_tokens") or DEFAULT_CONTEXT_WINDOW)
+
+	@classmethod
+	def supports_vision(cls, model_name: str) -> bool:
+		"""Whether this model accepts image input. Unknown models are treated as
+		text-only — sending an image a provider can't route kills the whole turn
+		(OpenRouter: 'No endpoints found that support image input')."""
+		m = cls.find(model_name)
+		return bool(m.get("vision")) if m else False
+
+	@classmethod
+	def get_default(cls, model_or_provider: str) -> str:
+		"""Resolve a selection to a model name. A known model passes through;
+		anything else (a provider name, or the legacy "openrouter" sentinel the
+		frontend still sends) falls back to the Builder Settings default, then to
+		the first configured model."""
+		if cls.find(model_or_provider):
+			return model_or_provider
+		default = get_configured_default()
+		if default and cls.find(default):
+			return default
+		catalog = cls.catalog()
+		return catalog[0]["name"] if catalog else model_or_provider
+
+	@classmethod
+	def is_known_model(cls, model: str) -> bool:
+		return cls.find(model) is not None
+
+
+def get_configured_default() -> str | None:
+	"""The model Builder Settings names as the default, which may not be available."""
+	return frappe.db.get_single_value("Builder Settings", "default_ai_model")

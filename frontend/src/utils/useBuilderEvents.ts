@@ -9,25 +9,37 @@ import { BuilderPage } from "@/types/doctypes";
 import blockController from "@/utils/blockController";
 import getBlockTemplate from "@/utils/blockTemplate";
 
+import { commandShortcuts } from "@/components/Commands";
+import { __ } from "@/translation";
 import { copyBuilderBlocks, pasteBuilderBlocks } from "@/utils/builderBlockCopyPaste";
+import { promptOversizedSVG, promptSaveVersion } from "@/utils/dialogs";
 import {
 	addPxToNumber,
 	getBlockCopy,
+	getImageBlock,
 	isDialogOpen,
 	isHTMLString,
+	isOversizedSVG,
 	isTargetEditable,
 	showDialog,
 	triggerCopyEvent,
 	uploadBuilderAsset,
+	uploadSVGAsFile,
 } from "@/utils/helpers";
-import { useEventListener, useStorage } from "@vueuse/core";
-import { toast, useShortcut } from "frappe-ui";
+import { useEventListener } from "@vueuse/core";
+import { toast, useKeyboardShortcut } from "frappe-ui";
 import { Ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 const builderStore = useBuilderStore();
 const canvasStore = useCanvasStore();
 const pageStore = usePageStore();
+
+async function resolveOversizedSVG(svg: string) {
+	if (!isOversizedSVG(svg) || !(await promptOversizedSVG(svg.length))) return null;
+	const { fileURL } = await uploadSVGAsFile(svg);
+	return fileURL || null;
+}
 
 export function useBuilderEvents(
 	pageCanvas: Ref<InstanceType<typeof BuilderCanvas> | null>,
@@ -82,7 +94,7 @@ export function useBuilderEvents(
 			if (file) {
 				uploadBuilderAsset(file).then((res: { fileURL: string; fileName: string }) => {
 					const selectedBlocks = blockController.getSelectedBlocks();
-					let parentBlock = selectedBlocks.length
+					let parentBlock: Block | null = selectedBlocks.length
 						? selectedBlocks[0]
 						: (canvasStore.activeCanvas?.getRootBlock() as Block);
 
@@ -117,15 +129,18 @@ export function useBuilderEvents(
 			e.preventDefault();
 			// paste html
 			if (blockController.isHTML()) {
-				blockController.setInnerHTML(text);
+				const fileURL = text.startsWith("<svg") ? await resolveOversizedSVG(text) : null;
+				blockController.setInnerHTML(fileURL ? `<img src="${fileURL}" />` : text);
 			} else {
 				let block = null as unknown as Block | BlockOptions;
 				block = getBlockTemplate("html");
 
 				if (text.startsWith("<svg")) {
 					if (text.includes("<image")) {
-						toast.warning("Warning", {
-							description: "SVG with inlined image in it is not supported. Please paste it as PNG instead.",
+						toast.warning(__("Warning"), {
+							description: __(
+								"SVG with inlined image in it is not supported. Please paste it as PNG instead.",
+							),
 						});
 						return;
 					}
@@ -142,9 +157,18 @@ export function useBuilderEvents(
 						svg.removeAttribute("height");
 					}
 					text = svg.outerHTML;
+
+					const fileURL = await resolveOversizedSVG(text);
+					if (fileURL) {
+						const imageBlock = getImageBlock(fileURL);
+						imageBlock.baseStyles = { ...block.baseStyles, ...imageBlock.baseStyles };
+						block = imageBlock;
+					}
 				}
 
-				block.innerHTML = text;
+				if (!block.attributes?.src) {
+					block.innerHTML = text;
+				}
 
 				const selectedBlocks = blockController.getSelectedBlocks();
 				let parentBlock = selectedBlocks.length ? selectedBlocks[0] : null;
@@ -214,113 +238,28 @@ export function useBuilderEvents(
 		}
 	});
 
-	useShortcut([
+	// a command that declares keys owns its binding; what is left needs the
+	// keyboard event or a canvas ref, so it stays a plain shortcut
+	useKeyboardShortcut([
+		...commandShortcuts(),
 		{
-			key: "\\",
-			ctrl: true,
-			description: "Toggle panels",
-			group: "View",
-			handler: (e) => {
-				builderStore.showRightPanel = !builderStore.showRightPanel;
-				builderStore.showLeftPanel = builderStore.showRightPanel;
-			},
-		},
-		{
-			key: "\\",
-			ctrl: true,
-			shift: true,
-			description: "Toggle left panel",
-			group: "View",
-			handler: () => {
-				builderStore.showLeftPanel = !builderStore.showLeftPanel;
-			},
-		},
-		{
-			key: "s",
-			ctrl: true,
-			description: "Save page / component",
-			group: "General",
+			combo: "Mod+S",
+			description: __("Save Page / Component"),
+			group: __("General"),
 			allowInInput: true,
 			handler: (e) => {
 				if (canvasStore.editingMode === "fragment") {
 					saveAndExitFragmentMode(e);
 					e.stopPropagation();
+				} else if (canvasStore.editingMode === "page" && !builderStore.readOnlyMode && !isDialogOpen()) {
+					promptSaveVersion();
 				}
 			},
 		},
 		{
-			key: "p",
-			ctrl: true,
-			description: "Preview",
-			group: "General",
-			handler: () => {
-				pageStore.savePage();
-				router.push({
-					name: "preview",
-					params: {
-						pageId: pageStore.selectedPage as string,
-					},
-				});
-			},
-		},
-		{
-			key: "f",
-			ctrl: true,
-			shift: true,
-			description: "Search blocks",
-			group: "General",
-			handler: () => {
-				builderStore.showSearchBlock = true;
-			},
-		},
-		{
-			key: "f",
-			ctrl: true,
-			description: "Focus property search",
-			group: "General",
-			allowInInput: true,
-			handler: () => {
-				document.querySelector(".properties-search-input")?.querySelector("input")?.focus();
-			},
-		},
-		{
-			key: "c",
-			ctrl: true,
-			shift: true,
-			description: "Copy block styles",
-			group: "Edit",
-			handler: () => {
-				if (blockController.isBlockSelected() && !blockController.multipleBlocksSelected()) {
-					const block = blockController.getSelectedBlocks()[0];
-					const copiedStyle = useStorage(
-						"copiedStyle",
-						{ blockId: "", style: {} },
-						sessionStorage,
-					) as Ref<StyleCopy>;
-					copiedStyle.value = {
-						blockId: block.blockId,
-						style: block.getStylesCopy(),
-					};
-				}
-			},
-		},
-		{
-			key: "d",
-			ctrl: true,
-			description: "Duplicate block",
-			group: "Edit",
-			handler: () => {
-				if (builderStore.readOnlyMode) return;
-				if (blockController.isBlockSelected() && !blockController.multipleBlocksSelected()) {
-					const block = blockController.getSelectedBlocks()[0];
-					block.duplicateBlock();
-				}
-			},
-		},
-		{
-			key: "Backspace",
-			description: "Delete selected blocks",
-			group: "Edit",
+			combo: "Backspace",
+			description: __("Delete Selected Blocks"),
+			group: __("Edit"),
 			handler: (e) => {
 				if (builderStore.readOnlyMode) return;
 				if (!blockController.isBlockSelected()) return;
@@ -332,9 +271,9 @@ export function useBuilderEvents(
 			},
 		},
 		{
-			key: "Delete",
-			description: "Delete selected blocks",
-			group: "Edit",
+			combo: "Delete",
+			description: __("Delete Selected Blocks"),
+			group: __("Edit"),
 			handler: (e) => {
 				if (builderStore.readOnlyMode) return;
 				if (!blockController.isBlockSelected()) return;
@@ -346,43 +285,19 @@ export function useBuilderEvents(
 			},
 		},
 		{
-			key: "Escape",
-			description: "Exit current mode",
-			group: "General",
-			condition: () => canvasStore.editingMode !== "page",
+			combo: "Escape",
+			description: __("Exit Current Mode"),
+			group: __("General"),
+			enabled: () => canvasStore.editingMode !== "page",
 			handler: (e) => {
 				canvasStore.exitFragmentMode(e);
 			},
 			preventDefault: false,
 		},
 		{
-			key: "z",
-			ctrl: true,
-			description: "Undo",
-			group: "Edit",
-			handler: () => {
-				if (canvasStore.activeCanvas?.history?.canUndo) {
-					canvasStore.activeCanvas?.history.undo();
-				}
-			},
-		},
-		{
-			key: "z",
-			ctrl: true,
-			shift: true,
-			description: "Redo",
-			group: "Edit",
-			handler: () => {
-				if (canvasStore.activeCanvas?.history?.canRedo) {
-					canvasStore.activeCanvas?.history.redo();
-				}
-			},
-		},
-		{
-			key: "0",
-			ctrl: true,
-			description: "Reset canvas zoom",
-			group: "Canvas",
+			combo: "Mod+Digit0",
+			description: __("Reset Canvas Zoom"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.setCanvasZoom?.(1, "center");
@@ -390,11 +305,9 @@ export function useBuilderEvents(
 			},
 		},
 		{
-			key: "0",
-			ctrl: true,
-			shift: true,
-			description: "Fit canvas to screen",
-			group: "Canvas",
+			combo: "Mod+Shift+Digit0",
+			description: __("Fit Canvas to Screen"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.setScaleAndTranslate();
@@ -402,54 +315,53 @@ export function useBuilderEvents(
 			},
 		},
 		{
-			key: "ArrowRight",
-			description: "Pan canvas right",
-			group: "Canvas",
+			combo: "ArrowRight",
+			description: __("Pan Canvas"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.moveCanvas("right");
 				}
 			},
-			condition: () => !blockController.isBlockSelected(),
+			enabled: () => !blockController.isBlockSelected(),
 		},
 		{
-			key: "ArrowLeft",
-			description: "Pan canvas left",
-			group: "Canvas",
+			combo: "ArrowLeft",
+			description: __("Pan Canvas"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.moveCanvas("left");
 				}
 			},
-			condition: () => !blockController.isBlockSelected(),
+			enabled: () => !blockController.isBlockSelected(),
 		},
 		{
-			key: "ArrowUp",
-			description: "Pan canvas up",
-			group: "Canvas",
+			combo: "ArrowUp",
+			description: __("Pan Canvas"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.moveCanvas("up");
 				}
 			},
-			condition: () => !blockController.isBlockSelected(),
+			enabled: () => !blockController.isBlockSelected(),
 		},
 		{
-			key: "ArrowDown",
-			description: "Pan canvas down",
-			group: "Canvas",
+			combo: "ArrowDown",
+			description: __("Pan Canvas"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.moveCanvas("down");
 				}
 			},
-			condition: () => !blockController.isBlockSelected(),
+			enabled: () => !blockController.isBlockSelected(),
 		},
 		{
-			key: "=",
-			ctrl: true,
-			description: "Zoom in",
-			group: "Canvas",
+			combo: "Mod+Equal",
+			description: __("Zoom In"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.zoomIn();
@@ -457,10 +369,9 @@ export function useBuilderEvents(
 			},
 		},
 		{
-			key: "-",
-			ctrl: true,
-			description: "Zoom out",
-			group: "Canvas",
+			combo: "Mod+Minus",
+			description: __("Zoom Out"),
+			group: __("Canvas"),
 			handler: () => {
 				if (pageCanvas.value) {
 					pageCanvas.value.zoomOut();
@@ -468,60 +379,46 @@ export function useBuilderEvents(
 			},
 		},
 		{
-			key: "c",
-			description: "Container mode",
-			group: "Tools",
+			combo: "C",
+			description: __("Container Mode"),
+			group: __("Tools"),
 			handler: () => {
 				if (builderStore.readOnlyMode) return;
 				builderStore.mode = "container";
 			},
 		},
 		{
-			key: "i",
-			description: "Image mode",
-			group: "Tools",
+			combo: "I",
+			description: __("Image Mode"),
+			group: __("Tools"),
 			handler: () => {
 				if (builderStore.readOnlyMode) return;
 				builderStore.mode = "image";
 			},
 		},
 		{
-			key: "t",
-			description: "Text mode",
-			group: "Tools",
+			combo: "T",
+			description: __("Text Mode"),
+			group: __("Tools"),
 			handler: () => {
 				if (builderStore.readOnlyMode) return;
 				builderStore.mode = "text";
 			},
 		},
 		{
-			key: "v",
-			description: "Select mode",
-			group: "Tools",
+			combo: "V",
+			description: __("Select Mode"),
+			group: __("Tools"),
 			handler: () => {
 				builderStore.mode = "select";
 			},
 		},
 		{
-			key: "h",
-			description: "Move / hand mode",
-			group: "Tools",
+			combo: "H",
+			description: __("Move / Hand Mode"),
+			group: __("Tools"),
 			handler: () => {
 				builderStore.mode = "move";
-			},
-		},
-		{
-			key: "l",
-			ctrl: true,
-			shift: true,
-			triggeredOn: "hold",
-			description: "Highlight Blocks with Client Scripts",
-			group: "View",
-			onHold: () => {
-				builderStore.highlightBlocksWithClientScripts = true;
-			},
-			onRelease: () => {
-				builderStore.highlightBlocksWithClientScripts = false;
 			},
 		},
 	]);
@@ -532,8 +429,8 @@ export function useBuilderEvents(
 			if (route.params.pageId && route.params.pageId !== "new") {
 				const currentModified = pageStore.activePage?.modified;
 				webComponent.reload();
-				webPages.fetchOne.submit(pageStore.activePage?.name).then((doc: BuilderPage[]) => {
-					if (currentModified !== doc[0]?.modified) {
+				webPages.fetchOne.submit(pageStore.activePage?.name).then((doc: BuilderPage[] | null) => {
+					if (currentModified !== doc?.[0]?.modified) {
 						pageStore.setPage(route.params.pageId as string, false, route.query);
 					}
 				});
@@ -575,24 +472,24 @@ const copySelectedBlocksToClipboard = (e: ClipboardEvent) => {
 	) {
 		// Handle dialog first and wait for response
 		showDialog({
-			title: "Copy entire page?",
-			message: "Do you want to copy the entire page including settings and scripts?",
+			title: __("Copy entire page?"),
+			message: __("Do you want to copy the entire page including settings and scripts?"),
 			actions: [
 				{
-					label: "Yes",
-					variant: "solid",
-					onClick: () => {
-						canvasStore.requiresConfirmationForCopyingEntirePage = false;
-						canvasStore.copyEntirePage = true;
-						triggerCopyEvent();
-					},
-				},
-				{
-					label: "No, just blocks",
+					label: __("No, just blocks"),
 					variant: "subtle",
 					onClick: () => {
 						canvasStore.requiresConfirmationForCopyingEntirePage = false;
 						canvasStore.copyEntirePage = false;
+						triggerCopyEvent();
+					},
+				},
+				{
+					label: __("Yes"),
+					variant: "solid",
+					onClick: () => {
+						canvasStore.requiresConfirmationForCopyingEntirePage = false;
+						canvasStore.copyEntirePage = true;
 						triggerCopyEvent();
 					},
 				},

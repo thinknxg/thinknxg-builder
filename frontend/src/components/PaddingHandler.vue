@@ -1,120 +1,87 @@
 <template>
-	<div
-		class="group"
-		:class="{
-			'opacity-40': !updating,
-			'opacity-70': updating,
-		}"
-		@click.stop>
+	<div class="group" @click.stop>
+		<CursorTooltip v-if="updating" tone="blue" :position="cursorPosition">
+			{{ getPaddingValue(activeSides[0]) }}
+		</CursorTooltip>
+		<!-- clipped to stay inside the 2px selection ring, which is drawn under the bands -->
+		<div class="pointer-events-none absolute inset-0 opacity-30 [clip-path:inset(2px)]">
+			<div
+				v-for="side in Object.values(Position)"
+				v-show="isActive(side)"
+				:key="side"
+				class="absolute bg-blue-400"
+				:class="fillPlacement[side]"
+				:style="fillSize(side)" />
+		</div>
 		<div
-			class="padding-handler pointer-events-none absolute flex w-full bg-purple-400"
+			class="padding-handler absolute flex w-full"
 			:style="{
 				height: topPaddingHandlerHeight + 'px',
+				cursor: isDraggable(topPaddingHandlerHeight) ? verticalCursor : undefined,
 			}"
-			ref="topPaddingHandler">
+			:class="isDraggable(topPaddingHandlerHeight) ? 'pointer-events-auto' : 'pointer-events-none'"
+			@mousedown.stop="handlePadding($event, Position.Top)">
 			<div
-				class="pointer-events-auto absolute left-[50%] rounded-full border-2 border-purple-500 bg-purple-400 hover:scale-125"
-				v-show="canvasProps.scale > 0.5"
-				:style="{
-					borderWidth: handleBorderWidth,
-					bottom: topHandle.bottom,
-					left: topHandle.left,
-					height: topHandle.height + 'px',
-					width: topHandle.width + 'px',
-				}"
-				:class="{
-					'cursor-ns-resize': !disableHandlers,
-					hidden: updating,
-				}"
+				class="pointer-events-auto absolute z-20 rounded-full border-2 border-blue-400 bg-blue-300 before:absolute before:-inset-2 before:content-[''] hover:scale-125"
+				v-show="showHandle"
+				:style="pillStyle(Position.Top)"
+				:class="{ hidden: updating }"
 				@mousedown.stop="handlePadding($event, Position.Top)" />
-			<div class="m-auto text-sm text-purple-900" v-show="updating">
-				{{ blockStyles.paddingTop }}
-			</div>
 		</div>
 		<div
-			class="padding-handler pointer-events-none absolute bottom-0 flex w-full bg-purple-400"
+			class="padding-handler absolute bottom-0 flex w-full"
 			:style="{
 				height: bottomPaddingHandlerHeight + 'px',
+				cursor: isDraggable(bottomPaddingHandlerHeight) ? verticalCursor : undefined,
 			}"
-			ref="bottomPaddingHandler">
+			:class="isDraggable(bottomPaddingHandlerHeight) ? 'pointer-events-auto' : 'pointer-events-none'"
+			@mousedown.stop="handlePadding($event, Position.Bottom)">
 			<div
-				class="pointer-events-auto absolute left-[50%] rounded-full border-2 border-purple-500 bg-purple-400 hover:scale-125"
-				v-show="canvasProps.scale > 0.5"
-				:style="{
-					borderWidth: handleBorderWidth,
-					top: bottomHandle.top,
-					left: bottomHandle.left,
-					height: bottomHandle.height + 'px',
-					width: bottomHandle.width + 'px',
-				}"
-				:class="{
-					'cursor-ns-resize': !disableHandlers,
-					hidden: updating,
-				}"
+				class="pointer-events-auto absolute z-20 rounded-full border-2 border-blue-400 bg-blue-300 before:absolute before:-inset-2 before:content-[''] hover:scale-125"
+				v-show="showHandle"
+				:style="pillStyle(Position.Bottom)"
+				:class="{ hidden: updating }"
 				@mousedown.stop="handlePadding($event, Position.Bottom)" />
-			<div class="m-auto text-sm text-purple-900" v-show="updating">
-				{{ blockStyles.paddingBottom }}
-			</div>
 		</div>
 		<div
-			class="padding-handler pointer-events-none absolute left-0 flex h-full bg-purple-400"
+			class="padding-handler absolute left-0 flex h-full"
 			:style="{
 				width: leftPaddingHandlerWidth + 'px',
+				cursor: isDraggable(leftPaddingHandlerWidth) ? horizontalCursor : undefined,
 			}"
-			ref="leftPaddingHandler">
+			:class="isDraggable(leftPaddingHandlerWidth) ? 'pointer-events-auto' : 'pointer-events-none'"
+			@mousedown.stop="handlePadding($event, Position.Left)">
 			<div
-				class="pointer-events-auto absolute top-[50%] rounded-full border-2 border-purple-500 bg-purple-400 hover:scale-125"
-				v-show="canvasProps.scale > 0.5"
-				:style="{
-					borderWidth: handleBorderWidth,
-					right: leftHandle.right,
-					top: leftHandle.top,
-					height: leftHandle.height + 'px',
-					width: leftHandle.width + 'px',
-				}"
-				:class="{
-					'cursor-ew-resize': !disableHandlers,
-					hidden: updating,
-				}"
+				class="pointer-events-auto absolute z-20 rounded-full border-2 border-blue-400 bg-blue-300 before:absolute before:-inset-2 before:content-[''] hover:scale-125"
+				v-show="showHandle"
+				:style="pillStyle(Position.Left)"
+				:class="{ hidden: updating }"
 				@mousedown.stop="handlePadding($event, Position.Left)" />
-			<div class="m-auto text-sm text-purple-900" v-show="updating">
-				{{ blockStyles.paddingLeft }}
-			</div>
 		</div>
 		<div
-			class="padding-handler pointer-events-none absolute right-0 flex h-full bg-purple-400"
+			class="padding-handler absolute right-0 flex h-full"
 			:style="{
 				width: rightPaddingHandlerWidth + 'px',
+				cursor: isDraggable(rightPaddingHandlerWidth) ? horizontalCursor : undefined,
 			}"
-			ref="rightPaddingHandler">
+			:class="isDraggable(rightPaddingHandlerWidth) ? 'pointer-events-auto' : 'pointer-events-none'"
+			@mousedown.stop="handlePadding($event, Position.Right)">
 			<div
-				class="pointer-events-auto absolute top-[50%] rounded-full border-2 border-purple-500 bg-purple-400 hover:scale-125"
-				v-show="canvasProps.scale > 0.5"
-				:style="{
-					borderWidth: handleBorderWidth,
-					left: rightHandle.left,
-					top: rightHandle.top,
-					height: rightHandle.height + 'px',
-					width: rightHandle.width + 'px',
-				}"
-				:class="{
-					'cursor-ew-resize': !disableHandlers,
-					hidden: updating,
-				}"
+				class="pointer-events-auto absolute z-20 rounded-full border-2 border-blue-400 bg-blue-300 before:absolute before:-inset-2 before:content-[''] hover:scale-125"
+				v-show="showHandle"
+				:style="pillStyle(Position.Right)"
+				:class="{ hidden: updating }"
 				@mousedown.stop="handlePadding($event, Position.Right)" />
-			<div class="m-auto text-sm text-purple-900" v-show="updating">
-				{{ blockStyles.paddingRight }}
-			</div>
 		</div>
 	</div>
 </template>
 <script setup lang="ts">
 import type Block from "@/block";
-import { Position, useSpacingHandler } from "@/composables/useSpacingHandler";
-import { computed, ref, watchEffect } from "vue";
+import { useRotatedCursors } from "@/composables/useRotatedCursors";
+import { HANDLE_MIN_SCALE, Position, useSpacingHandler } from "@/composables/useSpacingHandler";
+import { computed, watchEffect } from "vue";
 import { getNumberFromPx } from "../utils/helpers";
-
-import { toast } from "frappe-ui";
+import CursorTooltip from "./CursorTooltip.vue";
 
 const props = withDefaults(
 	defineProps<{
@@ -131,15 +98,43 @@ const props = withDefaults(
 );
 
 const emit = defineEmits(["update"]);
-const { canvasProps, updating, blockStyles, handleBorderWidth, longHandleSize, sideHandleSize } =
-	useSpacingHandler(
-		() => props.targetBlock,
-		() => props.breakpoint,
-	);
+const {
+	canvasProps,
+	updating,
+	activeSides,
+	cursorPosition,
+	blockStyles,
+	getSpacingValue,
+	handleBorderWidth,
+	longHandleSize,
+	sideHandleSize,
+	startSpacingDrag,
+} = useSpacingHandler(
+	() => props.targetBlock,
+	() => props.breakpoint,
+);
 
 watchEffect(() => {
 	emit("update", updating.value);
 });
+
+const fillPlacement = {
+	[Position.Top]: "left-0 top-0 w-full",
+	[Position.Bottom]: "bottom-0 left-0 w-full",
+	[Position.Left]: "left-0 top-0 h-full",
+	[Position.Right]: "right-0 top-0 h-full",
+};
+const isActive = (side: Position) => updating.value && activeSides.value.includes(side);
+
+const { rotation, horizontalCursor, verticalCursor } = useRotatedCursors(
+	() => props.target as Element,
+	() => props.targetBlock,
+);
+
+const MIN_DRAGGABLE_BAND = 8;
+
+const showHandle = computed(() => canvasProps.scale > HANDLE_MIN_SCALE);
+const isDraggable = (thickness: number) => !props.disableHandlers && thickness >= MIN_DRAGGABLE_BAND;
 
 const topPaddingHandlerHeight = computed(() => {
 	return getPadding("Top");
@@ -158,129 +153,66 @@ const rightPaddingHandlerWidth = computed(() => {
 });
 
 const getPadding = (side: "Top" | "Left" | "Right" | "Bottom") => {
-	blockStyles.value.paddingRight;
-	blockStyles.value.paddingTop;
-	blockStyles.value.paddingBottom;
-	blockStyles.value.paddingLeft;
 	blockStyles.value.padding;
 	return getNumberFromPx(getComputedStyle(props.target)[`padding${side}`]) * canvasProps.scale;
 };
 
-const topHandle = computed(() => {
-	const { width, height } = longHandleSize.value;
-	return {
-		width,
-		height,
-		bottom: `clamp(-20px, calc(-10px * ${canvasProps.scale}), -6px)`,
-		left: `calc(50% - ${width / 2}px)`,
-	};
+const getPaddingValue = (position: Position) => getSpacingValue("padding", position);
+
+// The pill sits in the middle of its band on both axes
+const handleStyle = (
+	size: { width: number; height: number },
+	offset: { x: number; y: number },
+	cursor: string,
+) => ({
+	borderWidth: handleBorderWidth.value,
+	left: `calc(50% + ${offset.x - size.width / 2}px)`,
+	top: `calc(50% + ${offset.y - size.height / 2}px)`,
+	width: `${size.width}px`,
+	height: `${size.height}px`,
+	cursor: props.disableHandlers ? undefined : cursor,
 });
+const bandThickness = {
+	[Position.Top]: topPaddingHandlerHeight,
+	[Position.Bottom]: bottomPaddingHandlerHeight,
+	[Position.Left]: leftPaddingHandlerWidth,
+	[Position.Right]: rightPaddingHandlerWidth,
+};
+const fillSize = (side: Position) => {
+	const isLong = side === Position.Top || side === Position.Bottom;
+	return { [isLong ? "height" : "width"]: `${bandThickness[side].value}px` };
+};
+// Pills stay fully inside the selection ring (ring-2 ring-inset in BlockEditor), so a
+// thin or empty band pushes its pill inward instead of centring it on the edge.
+const RING_WIDTH = 2;
+const RING_GAP = 2;
+const inwardDirection = {
+	[Position.Top]: 1,
+	[Position.Bottom]: -1,
+	[Position.Left]: 1,
+	[Position.Right]: -1,
+};
 
-const bottomHandle = computed(() => {
-	const { width, height } = longHandleSize.value;
-	return {
-		width,
-		height,
-		top: `clamp(-20px, calc(-10px * ${canvasProps.scale}), -6px)`,
-		left: `calc(50% - ${width / 2}px)`,
-	};
-});
-
-const leftHandle = computed(() => {
-	const { width, height } = sideHandleSize.value;
-	return {
-		width,
-		height,
-		right: `clamp(-20px, calc(-10px * ${canvasProps.scale}), -6px)`,
-		top: `calc(50% - ${height / 2}px)`,
-	};
-});
-
-const rightHandle = computed(() => {
-	const { width, height } = sideHandleSize.value;
-	return {
-		width,
-		height,
-		left: `clamp(-20px, calc(-10px * ${canvasProps.scale}), -6px)`,
-		top: `calc(50% - ${height / 2}px)`,
-	};
-});
-
-const messageShown = ref(false);
-
-const handlePadding = (ev: MouseEvent, position: Position) => {
-	if (props.disableHandlers) return;
-	// if (!messageShown.value && !(ev.shiftKey || ev.altKey)) {
-	// 	showToast();
-	// 	messageShown.value = true;
-	// }
-	updating.value = true;
-	const startY = ev.clientY;
-	const startX = ev.clientX;
-	const target = ev.target as HTMLElement;
-
-	const startTop = getNumberFromPx(blockStyles.value.paddingTop) || 5;
-	const startBottom = getNumberFromPx(blockStyles.value.paddingBottom) || 5;
-	const startLeft = getNumberFromPx(blockStyles.value.paddingLeft) || 5;
-	const startRight = getNumberFromPx(blockStyles.value.paddingRight) || 5;
-
-	// to disable cursor jitter
-	const docCursor = document.body.style.cursor;
-	document.body.style.cursor = window.getComputedStyle(target).cursor;
-
-	const mousemove = (mouseMoveEvent: MouseEvent) => {
-		let movement = 0;
-		let affectingAxis = null;
-		props.onUpdate && props.onUpdate();
-		if (position === Position.Top) {
-			movement = Math.max(startTop + mouseMoveEvent.clientY - startY, 0);
-			props.targetBlock.setStyle("paddingTop", movement + "px");
-			affectingAxis = "y";
-		} else if (position === Position.Bottom) {
-			movement = Math.max(startBottom + startY - mouseMoveEvent.clientY, 0);
-			props.targetBlock.setStyle("paddingBottom", movement + "px");
-			affectingAxis = "y";
-		} else if (position === Position.Left) {
-			movement = Math.max(startLeft + mouseMoveEvent.clientX - startX, 0);
-			props.targetBlock.setStyle("paddingLeft", movement + "px");
-			affectingAxis = "x";
-		} else if (position === Position.Right) {
-			movement = Math.max(startRight + startX - mouseMoveEvent.clientX, 0);
-			props.targetBlock.setStyle("paddingRight", movement + "px");
-			affectingAxis = "x";
-		}
-
-		if (mouseMoveEvent.altKey) {
-			if (affectingAxis === "y") {
-				props.targetBlock.setStyle("paddingTop", movement + "px");
-				props.targetBlock.setStyle("paddingBottom", movement + "px");
-			} else if (affectingAxis === "x") {
-				props.targetBlock.setStyle("paddingLeft", movement + "px");
-				props.targetBlock.setStyle("paddingRight", movement + "px");
-			}
-		} else if (mouseMoveEvent.shiftKey) {
-			props.targetBlock.setStyle("paddingTop", movement + "px");
-			props.targetBlock.setStyle("paddingBottom", movement + "px");
-			props.targetBlock.setStyle("paddingLeft", movement + "px");
-			props.targetBlock.setStyle("paddingRight", movement + "px");
-		}
-
-		mouseMoveEvent.preventDefault();
-		mouseMoveEvent.stopPropagation();
-	};
-	document.addEventListener("mousemove", mousemove);
-	document.addEventListener(
-		"mouseup",
-		(mouseUpEvent) => {
-			document.body.style.cursor = docCursor;
-			document.removeEventListener("mousemove", mousemove);
-			updating.value = false;
-			mouseUpEvent.preventDefault();
-		},
-		{ once: true },
+const pillStyle = (side: Position) => {
+	const isLong = side === Position.Top || side === Position.Bottom;
+	const size = isLong ? longHandleSize.value : sideHandleSize.value;
+	const thickness = isLong ? size.height : size.width;
+	const minCentre = RING_WIDTH + RING_GAP + thickness / 2;
+	const inset = Math.max(0, minCentre - bandThickness[side].value / 2) * inwardDirection[side];
+	return handleStyle(
+		size,
+		isLong ? { x: 0, y: inset } : { x: inset, y: 0 },
+		isLong ? verticalCursor.value : horizontalCursor.value,
 	);
 };
 
-let showToast = () =>
-	toast('Press "shift" key to apply padding to all sides and "alt" key to apply padding on either sides.');
+const handlePadding = (ev: MouseEvent, position: Position) => {
+	if (props.disableHandlers) return;
+	startSpacingDrag(ev, position, {
+		property: "padding",
+		fallback: getNumberFromPx(getComputedStyle(props.target).getPropertyValue(`padding-${position}`)),
+		getRotation: () => rotation.value,
+		onUpdate: props.onUpdate,
+	});
+};
 </script>

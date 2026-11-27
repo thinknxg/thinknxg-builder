@@ -1,16 +1,22 @@
 import type Block from "@/block";
 import { generateId, getBlockInstance, getBlockString } from "@/utils/helpers";
+import { historyTimestamp } from "@/utils/historyTimestamp";
+import { useBuilderToken } from "@/utils/useBuilderToken";
 import { debounceFilter, pausableFilter, watchIgnorable } from "@vueuse/core";
-import { ref, Ref } from "vue";
+import { ref, Ref, watch } from "vue";
 
 type CanvasState = {
 	block: string;
 	selectedBlockIds: Set<string>;
+	at?: number;
 };
 export type PauseId = string & { __brand: "PauseId" };
 
 const CAPACITY = 500;
 const DEBOUNCE_DELAY = 100;
+// each record serialises the whole tree, so a heavy page blows past this well before CAPACITY
+const MAX_BYTES = 20 * 1024 * 1024;
+const MIN_ENTRIES = 10;
 
 export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<string>>) {
 	const undoStack = ref([]) as Ref<CanvasState[]>;
@@ -22,6 +28,7 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 	// caller when the canvas returns to edit mode. Distinct from the transient,
 	// reference-counted pause()/resume() used during drag/resize.
 	const enabled = ref(true);
+	let pendingAt: number | undefined;
 
 	function disable() {
 		enabled.value = false;
@@ -30,12 +37,17 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 		enabled.value = true;
 	}
 
+	const debounceCommit = debounceFilter(DEBOUNCE_DELAY);
 	const {
 		eventFilter: blockWatcherFilter,
 		pause: pauseBlockWatcher,
 		resume: resumeBlockWatcher,
 		isActive: isTracking,
-	} = pausableFilter(debounceFilter(DEBOUNCE_DELAY));
+	} = pausableFilter((invoke, options) => {
+		if (!enabled.value) return;
+		pendingAt = historyTimestamp();
+		return debounceCommit(invoke, options);
+	});
 
 	const {
 		eventFilter: selectionWatherFilter,
@@ -49,6 +61,7 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 		stop: stopBlockWatcher,
 	} = watchIgnorable(source, commit, {
 		deep: true,
+		flush: "sync",
 		eventFilter: blockWatcherFilter,
 	});
 
@@ -61,16 +74,45 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 		eventFilter: selectionWatherFilter,
 	});
 
+	const tokens = useBuilderToken();
+	const stopTokenEditWatcher = watch(tokens.tokenEditVersion, clearRedo, { flush: "sync" });
+
 	function commit() {
-		if (!enabled.value) return;
-		undoStack.value.unshift(last.value);
-		last.value = createHistoryRecord();
-		if (undoStack.value.length > CAPACITY) {
-			undoStack.value.splice(CAPACITY, Number.POSITIVE_INFINITY);
-		}
+		if (!enabled.value || !isTracking.value) return;
+		const record = createHistoryRecord();
+		const at = pendingAt;
+		pendingAt = undefined;
+		if (record.block === last.value.block) return;
+		undoStack.value.unshift(stamp(last.value, at));
+		last.value = record;
+		trim(undoStack.value);
+		clearRedo();
+		tokens.clearTokenRedo();
+	}
+
+	function clearRedo() {
 		if (redoStack.value.length) {
 			redoStack.value.splice(0, redoStack.value.length);
 		}
+	}
+
+	function trim(stack: CanvasState[]) {
+		if (stack.length > CAPACITY) {
+			stack.splice(CAPACITY, Number.POSITIVE_INFINITY);
+		}
+		let bytes = 0;
+		for (let i = 0; i < stack.length; i++) {
+			bytes += stack[i].block.length;
+			if (bytes > MAX_BYTES && i >= MIN_ENTRIES) {
+				stack.splice(i + 1, Number.POSITIVE_INFINITY);
+				return;
+			}
+		}
+	}
+
+	function stamp(state: CanvasState, at = historyTimestamp()) {
+		state.at = at;
+		return state;
 	}
 
 	function updateSelections() {
@@ -80,7 +122,8 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 	function createHistoryRecord() {
 		return {
 			block: getBlockString(source.value),
-			selectedBlockIds: selectedBlockIds.value,
+			// copy, or every stacked entry aliases the live set
+			selectedBlockIds: new Set(selectedBlockIds.value),
 		};
 	}
 
@@ -110,7 +153,8 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 		if (!enabled.value) return;
 		const state = undoStack.value.shift();
 		if (state) {
-			redoStack.value.unshift(last.value);
+			redoStack.value.unshift(stamp(last.value));
+			trim(redoStack.value);
 			setSource(state);
 		}
 	}
@@ -123,7 +167,8 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 		if (!enabled.value) return;
 		const state = redoStack.value.shift();
 		if (state) {
-			undoStack.value.unshift(last.value);
+			undoStack.value.unshift(stamp(last.value));
+			trim(undoStack.value);
 			setSource(state);
 		}
 	}
@@ -133,8 +178,10 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 	}
 
 	function stop() {
+		disable();
 		stopBlockWatcher();
 		stopSelectedBlockUpdates();
+		stopTokenEditWatcher();
 	}
 
 	const clear = () => {
@@ -171,13 +218,19 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 		}
 		pauseIdSet.clear();
 		resumeTracking();
-		if (commitNow) commit();
+		if (commitNow) {
+			pendingAt = historyTimestamp();
+			commit();
+		}
 	}
 
 	function batch(callback: () => void) {
 		const pauseId = pause();
-		callback();
-		resume(pauseId, true);
+		try {
+			callback();
+		} finally {
+			resume(pauseId, true);
+		}
 	}
 
 	return {
@@ -186,8 +239,11 @@ export function useCanvasHistory(source: Ref<Block>, selectedBlockIds: Ref<Set<s
 		pause,
 		resume,
 		batch,
+		flush: commit,
 		canUndo,
 		canRedo,
+		lastUndoAt: () => undoStack.value[0]?.at ?? 0,
+		lastRedoAt: () => redoStack.value[0]?.at ?? 0,
 		dispose,
 		disable,
 		enable,

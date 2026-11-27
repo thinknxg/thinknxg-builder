@@ -4,7 +4,7 @@
 			ref="colorPickerRef"
 			:placement="placement"
 			:offset="popoverOffset"
-			@open="events.onFocus"
+			@open="handleOpen"
 			@close="handleClose"
 			:modelValue="resolvedColor"
 			@update:modelValue="
@@ -14,7 +14,7 @@
 			">
 			<template #target="{ togglePopover, isOpen }">
 				<div class="flex items-center justify-between">
-					<InputLabel v-if="label">{{ label }}</InputLabel>
+					<InputLabel v-if="label" class="w-1/3 min-w-[88px] shrink-0">{{ label }}</InputLabel>
 					<div class="relative w-full">
 						<Tooltip :text="isCssVariable ? resolvedColor : undefined">
 							<Autocomplete
@@ -25,16 +25,17 @@
 								}"
 								v-bind="events"
 								ref="colorInput"
+								:selectOnFocus="true"
 								:referenceElementSelector="autocompleteReferenceElementSelector"
 								@keydown.enter="handleEnter"
-								@focus="togglePopover"
 								:placeholder="displayPlaceholder"
-								:modelValue="displayValue"
+								:modelValue="modelValue"
+								:displayValue="displayValue"
 								:getOptions="getOptions"
 								:actionButton="
 									modelValue && !isCssVariable && props.showColorVariableOptions
 										? {
-												label: 'Save as Variable',
+												label: __('Save as Token'),
 												icon: 'lucide-plus',
 												handler: openVariableDialog,
 											}
@@ -42,14 +43,16 @@
 								"
 								@update:modelValue="handleColorUpdate">
 								<template #prefix>
-									<div
-										class="size-4 cursor-pointer rounded shadow-md"
+									<button
+										type="button"
+										class="size-4 cursor-pointer rounded-4 shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-outline-gray-4"
+										:aria-label="__('Open color picker')"
 										@click="togglePopover"
 										:style="{
 											background: modelValue
 												? resolvedColor
 												: `url(/assets/builder/images/color-circle.png) center / contain`,
-										}"></div>
+										}"></button>
 								</template>
 							</Autocomplete>
 						</Tooltip>
@@ -57,17 +60,18 @@
 				</div>
 			</template>
 		</ColorPicker>
-		<NewBuilderVariable v-model="showVariableDialog" :variable="newVariable" @success="handleVariableSaved" />
+		<NewBuilderToken v-model="showVariableDialog" :variable="newVariable" @success="handleVariableSaved" />
 	</div>
 </template>
 <script setup lang="ts">
+import { __ } from "@/translation";
 import Autocomplete from "@/components/Controls/Autocomplete.vue";
-import NewBuilderVariable from "@/components/Modals/NewBuilderVariable.vue";
+import NewBuilderToken from "@/components/Modals/NewBuilderToken.vue";
 import useBuilderStore from "@/stores/builderStore";
-import { BuilderVariable } from "@/types/doctypes";
+import { BuilderToken } from "@/types/doctypes";
 import { getColorVariableOptions } from "@/utils/colorOptions";
 import { getRGB } from "@/utils/helpers";
-import { useBuilderVariable } from "@/utils/useBuilderVariable";
+import { useBuilderToken } from "@/utils/useBuilderToken";
 import { Tooltip } from "frappe-ui";
 import { computed, ComputedRef, nextTick, onMounted, ref, useAttrs, watch } from "vue";
 import ColorPicker from "./ColorPicker.vue";
@@ -83,8 +87,8 @@ const events = Object.fromEntries(
 const colorInput = ref<typeof Autocomplete | null>(null);
 const colorPickerRef = ref<typeof ColorPicker | null>(null);
 const showVariableDialog = ref(false);
-const newVariable = ref<Partial<BuilderVariable> | null>(null);
-const { variables, resolveVariableValue, getVariableName } = useBuilderVariable();
+const newVariable = ref<Partial<BuilderToken> | null>(null);
+const { variables, resolveVariableValue, getVariableName } = useBuilderToken();
 
 const handleEnter = () => {
 	const val = props.modelValue;
@@ -156,7 +160,7 @@ const isValidColorInput = (val: string | null) => {
 
 const props = withDefaults(
 	defineProps<{
-		modelValue?: HashString | null;
+		modelValue?: string | null;
 		label?: string;
 		placeholder?: string;
 		placement?: "top" | "bottom" | "left" | "right";
@@ -167,7 +171,7 @@ const props = withDefaults(
 	}>(),
 	{
 		modelValue: null,
-		placeholder: "Set Color",
+		placeholder: __("Set Color"),
 		placement: "left",
 		showColorVariableOptions: true,
 		showPickerOnMount: false,
@@ -219,6 +223,12 @@ const displayPlaceholder = computed(() => {
 
 const emit = defineEmits(["update:modelValue"]);
 
+const handleOpen = () => {
+	if (typeof events.onFocus === "function") {
+		events.onFocus();
+	}
+};
+
 const handleClose = () => {
 	if (colorInput.value && typeof colorInput.value.blur === "function") {
 		colorInput.value.blur();
@@ -229,13 +239,11 @@ const handleClose = () => {
 };
 
 const openVariableDialog = () => {
-	newVariable.value = {
-		value: props.modelValue || "",
-	};
+	newVariable.value = { type: "Color", value: props.modelValue || "" };
 	showVariableDialog.value = true;
 };
 
-const handleVariableSaved = (savedVariable: BuilderVariable) => {
+const handleVariableSaved = (savedVariable: BuilderToken) => {
 	emit("update:modelValue", `var(--${savedVariable.name})`);
 };
 
@@ -249,9 +257,9 @@ const getOptions = async (query: string) => {
 		variables.value,
 		resolveVariableValue,
 		builderStore.canvasDarkMode,
-		(builderVariable) => {
+		(builderToken) => {
 			colorPickerRef.value?.togglePopover(false);
-			newVariable.value = { ...builderVariable };
+			newVariable.value = { ...builderToken };
 			showVariableDialog.value = true;
 		},
 	);

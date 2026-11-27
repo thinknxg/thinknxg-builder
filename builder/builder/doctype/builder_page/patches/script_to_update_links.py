@@ -1,7 +1,7 @@
 # 1. update in global script
-# <script defer data-api="https://frappecloud.com/api/event" data-domain="frappe.io" src="https://frappecloud.com/js/script.js"></script>
+# <script defer data-api="https://thinknxgcloud.com/api/event" data-domain="frappe.io" src="https://thinknxgcloud.com/js/script.js"></script>
 # 2. set blank header and footer from website settings
-# 3. Update urls using following script from frappe console https://frappecloud.com/dashboard/benches/bench-1700/sites
+# 3. Update urls using following script from frappe console https://thinknxgcloud.com/dashboard/benches/bench-1700/sites
 
 import frappe
 

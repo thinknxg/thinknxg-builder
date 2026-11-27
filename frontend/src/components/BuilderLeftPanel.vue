@@ -3,193 +3,148 @@
 		<PanelResizer
 			:dimension="builderStore.builderLayout.leftPanelWidth"
 			side="right"
-			:minDimension="200"
+			:minDimension="minWidth"
 			:maxDimension="500"
 			@resize="(width) => (builderStore.builderLayout.leftPanelWidth = width)" />
 		<div
 			class="flex min-h-full flex-col items-center gap-2 border-r border-outline-gray-1 p-3"
 			ref="miniSidebar">
-			<Tooltip v-for="option of leftPanelOptions" :key="option.value" :text="option.label" placement="right">
-				<Button
-					:icon="option.icon"
-					:class="{
-						'!text-ink-gray-6': builderStore.leftPanelActiveTab !== option.value,
-					}"
-					size="md"
-					:variant="
-						builderStore.leftPanelActiveTab === option.value ||
-						(showVariableManager && option.value === 'variables')
-							? 'subtle'
-							: 'ghost'
-					"
-					@click.stop="setActiveTab(option.value as LeftSidebarTabOption)"></Button>
-			</Tooltip>
+			<template v-for="tab of barTabs" :key="tab.name">
+				<div v-if="tab.name === firstPluginTab" class="w-6 border-t border-outline-gray-2" role="separator" />
+				<Tooltip side="right">
+					<template #content>
+						<span class="flex items-center gap-1.5">
+							{{ tab.label }}
+							<KeyboardShortcut v-if="tab.shortcut" :combo="tab.shortcut" class="!text-xs !text-ink-gray-4" />
+						</span>
+					</template>
+					<span class="relative inline-flex" @contextmenu="tab.plugin && openTabMenu($event, tab)">
+						<Button
+							:icon="tab.icon"
+							size="md"
+							:class="{ '!text-ink-gray-6': !isActive(tab) }"
+							:variant="isActive(tab) ? 'subtle' : 'ghost'"
+							@click.stop="select(tab)"></Button>
+						<!-- a tab a plugin added while the editor ran, until the user opens it -->
+						<span
+							v-if="unseenTabs.has(tab.name)"
+							class="pointer-events-none absolute right-1 top-1 size-2 animate-pulse rounded-full bg-surface-blue-6" />
+					</span>
+				</Tooltip>
+			</template>
 		</div>
+		<ContextMenu ref="tabMenu" :options="tabMenuOptions" :context="menuTab" />
 		<div
 			class="no-scrollbar relative min-h-full overflow-auto"
 			:style="{
 				width: `${builderStore.builderLayout.leftPanelWidth}px`,
-			}"
-			@click.stop="
-				builderStore.leftPanelActiveTab === 'Layers' && canvasStore.activeCanvas?.clearSelection()
-			">
-			<div v-show="builderStore.leftPanelActiveTab === 'Blocks'">
-				<BuilderBlockTemplates class="px-3 pb-3" />
-			</div>
-			<div v-show="builderStore.leftPanelActiveTab === 'Assets'">
-				<BuilderAssets class="px-3 pb-3" />
-			</div>
-			<div v-show="builderStore.leftPanelActiveTab === 'Layers'" class="p-3 pr-0">
-				<span class="flex items-center gap-2 pb-2 text-sm capitalize text-ink-gray-4">
-					<span
-						:class="[
-							canvasStore.activeCanvas?.canvasProps.breakpoints.find(
-								(b) => b.device === canvasStore.activeCanvas?.activeBreakpoint,
-							)?.icon || 'lucide-monitor',
-							'size-3',
-						]"
-						aria-hidden="true" />
-					{{ canvasStore.activeCanvas?.activeBreakpoint }}
-				</span>
-				<BlockLayers
-					class="block-layers w-fit min-w-full pr-3"
-					v-if="pageCanvas"
-					:disable-draggable="true"
-					:readonly="builderStore.readOnlyMode"
-					ref="pageLayers"
-					:blocks="[pageCanvas?.getRootBlock() as Block]"
-					v-show="canvasStore.editingMode == 'page'" />
-				<BlockLayers
-					class="block-layers w-fit min-w-full pr-3"
-					ref="componentLayers"
-					:disable-draggable="true"
-					:readonly="builderStore.readOnlyMode"
-					:blocks="[fragmentCanvas?.getRootBlock()]"
-					:indent="5"
-					:adjustForRoot="false"
-					v-if="canvasStore.editingMode === 'fragment' && fragmentCanvas" />
-			</div>
-			<div class="h-full" v-show="builderStore.leftPanelActiveTab === 'Code'">
-				<PageScript
-					:key="pageStore.selectedPage"
-					v-if="pageStore.selectedPage && pageStore.activePage"
-					:page="pageStore.activePage" />
-			</div>
+			}">
+			<template v-for="tab of tabs" :key="tab.name">
+				<div
+					v-if="tab.component && mountedTabs.has(tab.name)"
+					v-show="builderStore.leftPanelActiveTab === tab.name"
+					class="h-full">
+					<component :is="tab.component" v-bind="tab.props?.()" />
+				</div>
+			</template>
 		</div>
 
-		<VariableManager v-model="showVariableManager" :container="miniSidebar" />
+		<TokenManager
+			v-model="builderStore.showTokenManager"
+			:container="miniSidebar"
+			:readonly="Boolean(editorDemo)" />
 	</div>
 </template>
 <script setup lang="ts">
-import type Block from "@/block";
-import LayersIcon from "@/components/Icons/Layers.vue";
-import VariableManager from "@/components/Modals/VariableManager.vue";
-import PageScript from "@/components/PageScript.vue";
+import ContextMenu from "@/components/ContextMenu.vue";
+import { leftPanelTabs, type LeftPanelTab } from "@/components/LeftPanelTabs";
+import { hiddenPluginTabs, setPluginTabHidden, unseenTabs } from "@/data/plugins";
+import TokenManager from "@/components/Modals/TokenManager.vue";
+import { __ } from "@/translation";
+import { editorDemo } from "@/utils/editorDemo";
 import useBuilderStore from "@/stores/builderStore";
-import useCanvasStore from "@/stores/canvasStore";
-import usePageStore from "@/stores/pageStore";
-import { Tooltip } from "frappe-ui";
-import { inject, nextTick, Ref, ref, watch, watchEffect } from "vue";
+import { KeyboardShortcut, Tooltip, useKeyboardShortcut } from "frappe-ui";
+import { computed, reactive, Ref, ref, watch, watchEffect } from "vue";
 import { useRoute } from "vue-router";
-import BlockLayers from "./BlockLayers.vue";
-import BuilderAssets from "./BuilderAssets.vue";
-import BuilderBlockTemplates from "./BuilderBlockTemplates.vue";
-import BuilderCanvas from "./BuilderCanvas.vue";
 import PanelResizer from "./PanelResizer.vue";
 
-const showVariableManager = ref(false);
-const miniSidebar = ref(null) as Ref<HTMLElement | null>;
-const pageLayers = ref<InstanceType<typeof BlockLayers> | null>(null);
-const componentLayers = ref<InstanceType<typeof BlockLayers> | null>(null);
-
-const canvasStore = useCanvasStore();
 const builderStore = useBuilderStore();
-const pageStore = usePageStore();
-
-const pageCanvas = inject("pageCanvas") as Ref<InstanceType<typeof BuilderCanvas> | null>;
-const fragmentCanvas = inject("fragmentCanvas") as Ref<InstanceType<typeof BuilderCanvas> | null>;
-
 const route = useRoute();
 
-const leftPanelOptions = [
-	{
-		label: "Insert",
-		value: "Blocks",
-		icon: "lucide-plus",
-	},
-	{
-		label: "Layers",
-		value: "Layers",
-		icon: LayersIcon,
-	},
-	{
-		label: "Components",
-		value: "Assets",
-		icon: "lucide-box",
-	},
-	{
-		label: "Code",
-		value: "Code",
-		icon: "lucide-code",
-	},
-	{
-		label: "Variables",
-		value: "variables",
-		icon: "lucide-aperture",
-	},
-];
+const tabs = leftPanelTabs.visible;
 
-const setActiveTab = (tab: LeftSidebarTabOption) => {
-	if (tab === "variables") {
-		showVariableManager.value = !showVariableManager.value;
-	} else {
-		builderStore.leftPanelActiveTab = tab;
-		showVariableManager.value = false;
-	}
+const PANEL_MIN_WIDTH = 200;
+const activeTab = computed(() => tabs.value.find((tab) => tab.name === builderStore.leftPanelActiveTab));
+const minWidth = computed(() => Math.max(PANEL_MIN_WIDTH, activeTab.value?.minWidth ?? 0));
+
+// widen the stored width rather than only the drawn one: the canvas is laid out from it
+watch(
+	minWidth,
+	(min) => {
+		if (builderStore.builderLayout.leftPanelWidth < min) builderStore.builderLayout.leftPanelWidth = min;
+	},
+	{ immediate: true },
+);
+
+const miniSidebar = ref(null) as Ref<HTMLElement | null>;
+const mountedTabs = reactive(new Set<string>());
+
+const isActive = (tab: LeftPanelTab) => tab.isActive?.() ?? builderStore.leftPanelActiveTab === tab.name;
+
+// plugin tabs sit below the editor's own; a hidden one still shows while open, so Open has somewhere to land
+const pluginTabs = computed(() =>
+	tabs.value.filter((tab) => tab.plugin && (!hiddenPluginTabs.value.has(tab.plugin) || isActive(tab))),
+);
+const barTabs = computed(() => [...tabs.value.filter((tab) => !tab.plugin), ...pluginTabs.value]);
+const firstPluginTab = computed(() => pluginTabs.value[0]?.name);
+
+const tabMenu = ref<InstanceType<typeof ContextMenu> | null>(null);
+const menuTab = ref<LeftPanelTab | null>(null);
+const tabMenuOptions = [
+	{ label: __("Hide from left bar"), action: (tab: LeftPanelTab) => setPluginTabHidden(tab.plugin!, true) },
+];
+const openTabMenu = (event: MouseEvent, tab: LeftPanelTab) => {
+	menuTab.value = tab;
+	tabMenu.value?.show(event);
 };
 
+watch(
+	() => builderStore.leftPanelActiveTab,
+	(tab) => unseenTabs.delete(tab),
+);
+
+const select = (tab: LeftPanelTab) => {
+	if (tab.action) return tab.action();
+	builderStore.leftPanelActiveTab = tab.name;
+	builderStore.showTokenManager = false;
+};
+
+// read once at setup, so a tab registered later gets no binding until reload
+useKeyboardShortcut(
+	tabs.value
+		.filter((tab) => tab.shortcut)
+		.map((tab) => ({
+			combo: tab.shortcut!,
+			description: `Show ${tab.label} Panel`,
+			group: "View",
+			handler: () => select(tab),
+		})),
+);
+
+// a non-lazy tab mounts as soon as it registers, a lazy one on first open
 watchEffect(() => {
-	if (pageLayers.value) {
-		builderStore.activeLayers = pageLayers.value;
-	} else if (componentLayers.value) {
-		builderStore.activeLayers = componentLayers.value;
-	}
+	tabs.value.forEach((tab) => {
+		if (!tab.component) return;
+		if (!tab.lazy || builderStore.leftPanelActiveTab === tab.name || tab.preload?.()) {
+			mountedTabs.add(tab.name);
+		}
+	});
 });
 
 watch(
 	() => route.fullPath,
 	() => {
-		showVariableManager.value = false;
+		builderStore.showTokenManager = false;
 	},
-);
-
-// moved out of BlockLayers for performance
-// TODO: Find a better way to do this
-watch(
-	() => canvasStore.activeCanvas?.hoveredBlock,
-	() => {
-		document.querySelectorAll(`[data-block-layer-id].hovered-block`).forEach((el) => {
-			el.classList.remove("hovered-block");
-		});
-		if (canvasStore.activeCanvas?.hoveredBlock) {
-			document
-				.querySelector(`[data-block-layer-id="${canvasStore.activeCanvas.hoveredBlock}"]`)
-				?.classList.add("hovered-block");
-		}
-	},
-);
-
-watch(
-	() => canvasStore.activeCanvas?.selectedBlockIds,
-	async () => {
-		await nextTick();
-		const selectedBlocks = document.querySelectorAll(`[data-block-layer-id].block-selected`);
-		selectedBlocks.forEach((el) => el.classList.remove("block-selected"));
-		Array.from(canvasStore.activeCanvas?.selectedBlockIds || new Set([])).forEach((blockId: string) => {
-			const blockElement = document.querySelector(`[data-block-layer-id="${blockId}"]`);
-			blockElement?.classList.add("block-selected");
-		});
-	},
-	{ deep: true },
 );
 </script>

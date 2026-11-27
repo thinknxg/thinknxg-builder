@@ -13,7 +13,7 @@ interface DocType {
     idx?: number;
   }
   
-// Last updated: 2026-06-05 16:00:00.000000
+// Last updated: 2026-10-24 12:00:00.000000
 export interface BuilderSettings extends DocType {
   /** Script: Code */
   script?: string;
@@ -43,6 +43,8 @@ export interface BuilderSettings extends DocType {
   restrict_click_handlers: 0 | 1;
   /** AI API Key: Password */
   ai_api_key?: string;
+  /** Persona Survey Done: Check */
+  persona_survey_done: 0 | 1;
 }
 
 // Last updated: 2024-11-13 20:08:24.187664
@@ -54,13 +56,13 @@ export interface UserFont extends DocType {
 }
 
 // Last updated: 2026-05-24 12:00:00.000000
-export interface BuilderVariable extends DocType {
+export interface BuilderToken extends DocType {
   /** Type: Select */
-  type?: 'Color' | 'Dimension';
+  type?: 'Color' | 'Dimension' | 'Font';
   /** Value: Data */
   value: string;
-  /** Variable Name: Data */
-  variable_name: string;
+  /** Token Name: Data */
+  token_name: string;
   /** Is Standard: Check */
   is_standard: 0 | 1;
   /** Dark Value: Data */
@@ -71,28 +73,28 @@ export interface BuilderVariable extends DocType {
 
 // Last updated: 2025-11-11 11:51:16.422175
 export interface BuilderProjectFolder extends DocType {
-	/** Folder Name: Data */
-	folder_name?: string;
-	/** Is Standard: Check */
-	is_standard: 0 | 1;
+  /** Folder Name: Data */
+  folder_name?: string;
+  /** Is Standard: Check */
+  is_standard: 0 | 1;
 }
 
 // Last updated: 2024-09-19 13:07:00.935349
 export interface BlockTemplate extends DocType {
-  /** Template Name: Data */
-  template_name: string;
-  /** Block: JSON */
-  block: any;
-  /** Preview: Data */
-  preview: string;
-  /** Category: Select */
-  category?: 'Structure' | 'Basic' | 'Typography' | 'Basic Forms' | 'Form parts' | 'Media' | 'Advanced';
-  /** Preview Width: Int */
-  preview_width?: number;
-  /** Preview Height: Int */
-  preview_height?: number;
-  /** Sort Order: Int */
-  sort_order?: number;
+	/** Template Name: Data */
+	template_name: string;
+	/** Block: JSON */
+	block: any;
+	/** Preview: Data */
+	preview: string;
+	/** Category: Select */
+	category?: "Structure" | "Basic" | "Typography" | "Basic Forms" | "Form parts" | "Media" | "Advanced";
+	/** Preview Width: Int */
+	preview_width?: number;
+	/** Preview Height: Int */
+	preview_height?: number;
+	/** Sort Order: Int */
+	sort_order?: number;
 }
 
 // Last updated: 2023-11-21 12:47:20.938211
@@ -101,7 +103,7 @@ export interface BuilderPageClientScript extends ChildDocType {
 	builder_script: string;
 }
 
-// Last updated: 2026-06-10 10:55:22.349246
+// Last updated: 2026-10-05 13:10:00.000000
 export interface BuilderClientScript extends DocType {
   /** Script: Code */
   script: string;
@@ -111,7 +113,7 @@ export interface BuilderClientScript extends DocType {
   public_url?: string;
 }
 
-// Last updated: 2026-06-04 10:00:00.000000
+// Last updated: 2026-09-11 16:00:00.000000
 export interface BuilderPage extends DocType {
   /** Page Name: Data */
   page_name?: string;
@@ -119,6 +121,8 @@ export interface BuilderPage extends DocType {
   route?: string;
   /** Published: Check */
   published: 0 | 1;
+  /** Staging: Check */
+  staging: 0 | 1;
   /** Blocks: Long Text */
   blocks?: any;
   /** Page Preview: Data */
@@ -179,11 +183,11 @@ export interface BuilderSnapshot extends DocType {
 	data: string;
 }
 
-// Last updated: 2025-01-29 09:30:34.896956
+// Last updated: 2026-08-18 18:11:58.308298
 export interface BuilderComponent extends DocType {
   /** Component Name: Data */
   component_name?: string;
-  /** Block: JSON */
+  /** Block: Long Text */
   block?: any;
   /** For Web Page: Link (Builder Page) */
   for_web_page?: string;
@@ -191,4 +195,40 @@ export interface BuilderComponent extends DocType {
   component_id?: string;
   /** Component Data Script: Code */
   component_data_script?: string;
+}
+
+// Last updated: 2026-10-20 12:00:00.000000
+export interface BuilderAIProvider extends DocType {
+  /** Provider Name: Data */
+  provider_name: string;
+  /** Enabled: Check */
+  enabled: 0 | 1;
+  /** Route Prefix: Data */
+  route_prefix?: string;
+  /** LiteLLM Provider: Data */
+  litellm_provider?: string;
+  /** API Base: Data */
+  api_base?: string;
+  /** API Key: Password */
+  api_key?: string;
+}
+
+// Last updated: 2026-10-27 12:00:00.000000
+export interface BuilderAIModel extends DocType {
+  /** Label: Data */
+  label: string;
+  /** Provider: Link (Builder AI Provider) */
+  provider: string;
+  /** Model ID: Data */
+  model_id: string;
+  /** Enabled: Check */
+  enabled: 0 | 1;
+  /** Discovered: Check */
+  discovered: 0 | 1;
+  /** Supports Vision: Check */
+  supports_vision: 0 | 1;
+  /** Context Window: Int */
+  max_tokens?: number;
+  /** Frontier Rank: Int */
+  frontier_rank?: number;
 }

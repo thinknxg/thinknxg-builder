@@ -1,4 +1,4 @@
-# Copyright (c) 2024, Frappe Technologies Pvt Ltd and contributors
+# Copyright (c) 2024, thinkNXG Technologies Pvt Ltd and contributors
 # For license information, please see license.txt
 
 import frappe
@@ -46,6 +46,6 @@ def is_system_activity():
 		frappe.flags.in_import
 		or frappe.flags.in_patch
 		or frappe.flags.in_migrate
-		or frappe.in_test
+		or frappe.flags.in_test
 		or frappe.flags.in_install
 	)

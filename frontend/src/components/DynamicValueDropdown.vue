@@ -3,7 +3,7 @@
 		<Autocomplete
 			ref="autocompleteRef"
 			class="w-full"
-			placeholder="Value"
+			:placeholder="__('Value')"
 			:modelValue="autocompleteValue"
 			:getOptions="getOptions"
 			:showInputAsOption="true"
@@ -11,7 +11,7 @@
 
 		<div
 			v-if="dynamicValue?.key"
-			class="pointer-events-none absolute bottom-0 left-0 right-0 top-0 flex items-center gap-2 rounded bg-surface-violet-2 py-0.5 pl-2.5 pr-7 text-sm text-ink-violet-8">
+			class="pointer-events-none absolute bottom-0 left-0 right-0 top-0 flex items-center gap-2 rounded-4 bg-surface-violet-2 py-0.5 pl-2.5 pr-7 text-sm text-ink-violet-8">
 			<span class="lucide-zap size-3 shrink-0" aria-hidden="true" />
 			<MiddleTruncate :text="dynamicValue.key" />
 		</div>
@@ -30,6 +30,7 @@
 import Autocomplete from "@/components/Controls/Autocomplete.vue";
 import MiddleTruncate from "@/components/MiddleTruncate.vue";
 import usePageStore from "@/stores/pageStore";
+import { filterOptions } from "@/utils/autocompleteOptions";
 import blockController from "@/utils/blockController";
 import { getDataArray, getDefaultPropsList, getParentProps, getRepeaterScopedData } from "@/utils/helpers";
 import { computed, ref, watch } from "vue";
@@ -77,7 +78,7 @@ const parentProps = computed(() => {
 
 const defaultProps = computed(() => {
 	if (!currentBlock.value) return [];
-	return Object.keys(getDefaultPropsList(currentBlock.value, blockController));
+	return Object.keys(getDefaultPropsList(currentBlock.value));
 });
 
 const autocompleteValue = computed(() => {
@@ -100,12 +101,7 @@ const dynamicOptions = computed(() => {
 	return options;
 });
 
-const getOptions = async (query: string) => {
-	const normalizedQuery = query.trim().toLowerCase();
-	return dynamicOptions.value.filter((option) => {
-		return !normalizedQuery || option.label.toLowerCase().includes(normalizedQuery);
-	});
-};
+const getOptions = async (query: string) => filterOptions(dynamicOptions.value, query);
 
 const handleModelValueUpdate = (value: string | null) => {
 	if (value == null) {

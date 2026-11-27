@@ -1,17 +1,49 @@
 import useBuilderStore from "@/stores/builderStore";
+import { leftPanelTabs } from "@/components/LeftPanelTabs";
 import useCanvasStore from "@/stores/canvasStore";
 import getBlockTemplate from "@/utils/blockTemplate";
 import { getBlock, getBlockInfo, isBlock } from "@/utils/helpers";
+import { isReorderable, startBlockReorder } from "@/utils/useBlockReorder";
 import { useEventListener } from "@vueuse/core";
 import { nextTick } from "vue";
 
 const builderStore = useBuilderStore();
 const canvasStore = useCanvasStore();
 
+// Native form controls in blocks are preview-only in the canvas; interactions are tested via /preview.
+const NATIVE_CONTROL_SELECTOR = "select, input, textarea, audio, video";
+
 export function useBlockEventHandlers(target: HTMLElement) {
+	useEventListener(target, "mousedown", suppressNativeControlActivation, { capture: true });
+	useEventListener(target, "focusin", blurNativeControls);
+	useEventListener(target, "mousedown", handleMouseDown);
 	useEventListener(target, "click", handleClick);
 	useEventListener(target, "dblclick", handleDoubleClick);
 	useEventListener(target, "contextmenu", triggerContextMenu);
+
+	// A select opens its picker on mousedown, before click-phase selection runs.
+	function suppressNativeControlActivation(e: MouseEvent) {
+		if (!isBlock(e) || isEditable(e)) return;
+		const el = e.target as HTMLElement;
+		if (el.closest(NATIVE_CONTROL_SELECTOR)) e.preventDefault();
+	}
+
+	function blurNativeControls(e: FocusEvent) {
+		const el = e.target as HTMLElement;
+		if (el.matches?.(NATIVE_CONTROL_SELECTOR) && el.closest(".__builder_component__")) el.blur();
+	}
+
+	// Press-and-drag any block to reorder it in one gesture (no need to select
+	// first). The threshold inside startBlockReorder means a plain click still
+	// falls through to handleClick for selection.
+	function handleMouseDown(e: MouseEvent) {
+		if (e.button !== 0) return;
+		if (!isBlock(e) || isEditable(e)) return;
+		if (builderStore.mode !== "select" || builderStore.readOnlyMode) return;
+		const block = getBlock(e);
+		if (!block || !isReorderable(block)) return;
+		startBlockReorder(e, block, getBlockInfo(e).breakpoint);
+	}
 
 	function handleClick(e: MouseEvent) {
 		if (!isBlock(e) || isEditable(e)) return;
@@ -100,5 +132,8 @@ const selectBlock = (e: MouseEvent) => {
 	canvasStore.selectBlock(block, e);
 	canvasStore.activeCanvas?.setActiveBreakpoint(breakpoint);
 
-	if (builderStore.leftPanelActiveTab !== "Code") builderStore.leftPanelActiveTab = "Layers";
+	const activeTab = leftPanelTabs.all.value.find((tab) => tab.name === builderStore.leftPanelActiveTab);
+	if (!activeTab?.keepOpenOnSelection) {
+		builderStore.leftPanelActiveTab = "Layers";
+	}
 };

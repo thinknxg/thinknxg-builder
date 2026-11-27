@@ -1,0 +1,348 @@
+"""Artifact generators — produce a large streamed artifact for a tool.
+
+An *artifact tool* (one that sets `artifact=` on its `Tool`) delegates its
+execution to a generator here. The generator runs on the user's selected *heavy*
+model and streams the artifact to the client as plain content — reliable, unlike
+tool-call argument streaming, which providers buffer (the canvas would stay
+blank for the whole completion). After streaming, it returns the canonical
+client op(s) for the loop to emit so the frontend applies the authoritative,
+fully-parsed result.
+
+The agent calling the tool is the only trigger: when the fast conversational
+model decides to build the page, it calls `generate_page(brief=…)` and the loop
+hands off here. No DB status or out-of-band heuristic gates generation.
+"""
+
+import base64
+import logging
+import re
+import time
+
+import frappe
+
+from builder.ai import llm
+from builder.ai.models import ModelRegistry
+from builder.ai.prompts import Prompts
+from builder.ai.session import AISession
+from builder.public_fetch import public_session
+
+logger = frappe.logger("builder.ai.agent.artifact")
+logger.setLevel(logging.INFO)
+
+# Brief marker lines the design flow emits for images the generator should SEE
+# (not just place): the user's reference and the chosen hero shot.
+IMAGE_MARKER_RE = re.compile(r"(?:REFERENCE|HERO) IMAGE:\s*(\S+)", re.IGNORECASE)
+MAX_ATTACHED_IMAGES = 2
+MAX_IMAGE_BYTES = 3 * 1024 * 1024
+IMAGE_CHECK_TIMEOUT = 5
+
+
+def image_url_resolves(url: str) -> bool:
+	"""Whether the provider will be able to fetch this image.
+
+	An attached URL is downloaded by the provider, and one it cannot reach fails
+	the ENTIRE completion (OpenRouter: 400 "Error while downloading file. Upstream
+	status code: 404"), which the user sees as "Something went wrong". Models
+	retype these URLs out of search results and transpose digits, so a cheap HEAD
+	is worth it before betting the turn on one.
+
+	The URL comes out of a brief the model wrote, so it gets the same SSRF guard
+	as any other fetch, and redirects are left for the provider to follow — a
+	public URL that hops to an internal address must not be probed from here.
+	A 3xx still counts as resolvable, since the provider will follow it.
+	"""
+	try:
+		session = public_session()
+		r = session.head(url, timeout=IMAGE_CHECK_TIMEOUT, allow_redirects=False)
+		if r.status_code in (403, 405):  # some CDNs only answer GET
+			r = session.get(url, timeout=IMAGE_CHECK_TIMEOUT, stream=True, allow_redirects=False)
+			r.close()
+		return r.ok
+	except Exception as e:
+		logger.warning(f"brief image {url} unreachable: {e}")
+		return False
+
+
+def brief_image_parts(brief: str, skip: set[str] | None = None) -> list[dict]:
+	"""Resolve the brief's image markers into message image parts. https URLs are
+	attached directly (the provider fetches them); site file paths (public or
+	private) are read from the site and inlined as data URLs. The marker lines always stay in the brief text,
+	so the model still knows the exact URLs to place in blocks."""
+	parts = []
+	for url in IMAGE_MARKER_RE.findall(brief or ""):
+		if len(parts) >= MAX_ATTACHED_IMAGES:
+			break
+		if url in (skip or ()):  # already attached as the turn's own image
+			continue
+		if url.startswith("https://"):
+			if not image_url_resolves(url):
+				logger.warning(f"skipping unreachable brief image: {url}")
+				continue
+			parts.append({"type": "image_url", "image_url": {"url": url}})
+		elif url.startswith(("/files/", "/private/files/")):
+			data_url = read_site_image(url)
+			if data_url:
+				parts.append({"type": "image_url", "image_url": {"url": data_url}})
+	return parts
+
+
+def read_site_image(file_url: str) -> str | None:
+	try:
+		name = frappe.db.get_value("File", {"file_url": file_url}, "name")
+		if not name:
+			return None
+		file = frappe.get_doc("File", name)
+		# The path may come out of a model-written brief, so a private file is only
+		# inlined when the user this run acts for may actually read it.
+		if file.is_private and not file.has_permission("read"):
+			logger.warning(f"read_site_image: {file_url} is private and not readable here")
+			return None
+		content = file.get_content()
+		if isinstance(content, str):
+			content = content.encode()
+		if not content or len(content) > MAX_IMAGE_BYTES:
+			return None
+		ext = (file_url.rsplit(".", 1)[-1] or "png").lower()
+		mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp", "gif": "gif"}.get(ext)
+		if not mime:
+			return None
+		return f"data:image/{mime};base64,{base64.b64encode(content).decode()}"
+	except Exception as e:
+		logger.warning(f"read_site_image failed for {file_url}: {e}")
+		return None
+
+
+def found_photo_list(ctx) -> str:
+	"""The turn's search_images results, as an inventory the generator can draw on.
+
+	Every url here came back from a provider, so it resolves — unlike one the model
+	retyped from memory. Copy them EXACTLY."""
+	found = getattr(ctx, "found_images", None) or []
+	if not found:
+		return ""
+	preamble = (
+		"PHOTOS AVAILABLE for this page — real results already searched for you. Use these "
+		"EXACT urls in img src (copy character for character, never retype or guess one), and "
+		"give every section that wants a photo one of them rather than falling back to a CSS "
+		"composition. Unused ones are fine to ignore."
+	)
+	lines = [preamble]
+	for i, p in enumerate(found, 1):
+		desc = (p.get("description") or "").strip()[:100] or p.get("query") or "photo"
+		lines.append(f"{i}. [{p.get('query')}] {desc} — {p.get('size')}\n   {p.get('url')}")
+	return "\n".join(lines)
+
+
+def reference_geometry(ctx) -> str:
+	"""Geometry of every reference read this turn — the generator sees only the
+	brief, and prose loses exactly these load-bearing values. The FIRST read is
+	the page the agent was told to match (the user-named page or the home page),
+	so it is labelled primary; unordered references let a stray sibling read
+	restyle the build with the wrong design system."""
+	reads = getattr(ctx, "reference_reads", None) or []
+	if not reads:
+		return ""
+	preamble = (
+		"REFERENCE PAGE GEOMETRY — pages of this site read this turn as references. When "
+		"the brief asks this page to match them or sit in the same site, what follows is "
+		"ground truth over any prose: reproduce the SAME root geometry (e.g. a shell row "
+		"of rail component + scrolling main column) instead of defaulting to a plain "
+		"vertical stack, and give each font the ROLE its usage shows — the dominant family "
+		"is the working face for headings AND body; a font used once is a one-spot accent "
+		"to reproduce in that one place (its element, its size), never the display face "
+		"for every heading and never every section's opener — at most the hero moment. "
+		"The reference's measured sizes beat this prompt's scale defaults: a calm "
+		"reference stays calm."
+	)
+	if len(reads) == 1:
+		return preamble + "\n\n" + reads[0]
+	labelled = [
+		f"PRIMARY REFERENCE — the page to match; where references disagree, THIS one is law:\n{reads[0]}"
+	]
+	labelled += [
+		f"SECONDARY REFERENCE — background only, never the system to match:\n{read}" for read in reads[1:]
+	]
+	return preamble + "\n\n" + "\n\n".join(labelled)
+
+
+def log_generation_quality(model: str, finish_reason: str | None, text: str, root: dict | None) -> None:
+	"""Make the generation path debuggable: model, finish_reason, markup size and the
+	top-level section count of what landed. A thin or broken page shows up here as a
+	'length' finish or very few sections, telling a weak model from a pipeline bug."""
+	sections = len(root.get("children") or []) if root else 0
+	level = logging.WARNING if (finish_reason == "length" or sections <= 1) else logging.INFO
+	logger.log(
+		level,
+		"generate_page quality | model=%s finish_reason=%s chars=%d top_sections=%s",
+		model,
+		finish_reason,
+		len(text),
+		sections,
+	)
+	if not root:
+		logger.warning("generate_page unparsed head:\n%s", text[:800])
+
+
+def stream_buffer_key(page_id: str) -> str:
+	return f"builder_ai_page_stream:{page_id}"
+
+
+def save_stream_buffer(ctx, blocks: list) -> None:
+	"""Keep the latest preview frame in Redis so an editor that loads (or refreshes)
+	mid-build shows the live build instead of a stale draft."""
+	frappe.cache().set_value(
+		stream_buffer_key(ctx.page_id),
+		frappe.as_json({"blocks": blocks, "session_id": ctx.session_id}),
+		expires_in_sec=600,
+	)
+
+
+def clear_stream_buffer(page_id: str | None) -> None:
+	if page_id:
+		frappe.cache().delete_value(stream_buffer_key(page_id))
+
+
+PREVIEW_INTERVAL = 0.5
+
+
+class PagePreview:
+	"""The live canvas preview of a page still being written: the complete lines so
+	far, expanded here (the one parser) and streamed as a block tree, at most every
+	PREVIEW_INTERVAL seconds."""
+
+	def __init__(self, ctx):
+		self.ctx = ctx
+		self.sent_at = 0.0
+		self.sent_upto = 0
+
+	def update(self, text: str) -> None:
+		cut = text.rfind("\n")
+		if cut <= self.sent_upto or time.monotonic() - self.sent_at < PREVIEW_INTERVAL:
+			return
+		from builder.ai.page_writer import expand_page_markup
+
+		blocks, _ = expand_page_markup(text[:cut], errors=[])
+		if not blocks:
+			return
+		self.sent_at, self.sent_upto = time.monotonic(), cut
+		self.ctx.emit_to_page("stream", kind="page_blocks", blocks=blocks)
+		self.ctx.show_build_progress(blocks)
+		save_stream_buffer(self.ctx, blocks)
+
+
+def generate_page_markup(ctx, args: dict) -> list[dict]:
+	"""Stream a complete page of markup on the heavy model, persist it to the page
+	(the server is authoritative), and return a `generate_page` client op carrying
+	the expanded block tree — the canvas applies that, so both sides share block ids.
+
+	`ctx` is the AgentRunner. `args["brief"]` is the concise spec the
+	conversational model assembled from the approved plan / conversation.
+	Streams `kind="page_blocks"` frames to the canvas as the model writes
+	(live preview only; the returned op is the final word).
+	Returns [] if the model produced nothing usable.
+	"""
+	brief = (args.get("brief") or "").strip()
+
+	messages: list[dict] = [
+		# 1h TTL: the generation system prompt is identical across every build on
+		# the site, so it stays a cache read from one page build to the next.
+		{
+			"role": "system",
+			"content": Prompts.GENERATION,
+			"cache_control": {"type": "ephemeral", "ttl": "1h"},
+		},
+	]
+	# Prior conversation (incl. the approved plan) as proper role-tagged turns, with
+	# the newest attached images re-shown — a reference design pasted on an earlier
+	# turn must reach the step that actually draws the page.
+	messages.extend(
+		AISession.build_context_messages_from_id(
+			ctx.session_id, include_images=ModelRegistry.supports_vision(ctx.model)
+		)
+	)
+	# The photos this turn actually found. Without them the generator can only use
+	# urls the model retyped into the brief, which is why pages came back with one
+	# photo or none: transcribing urls by hand is work, so it mostly didn't happen.
+	if photos := found_photo_list(ctx):
+		messages.append({"role": "user", "content": photos})
+	# The geometry of reference pages read this turn — the brief alone cannot carry it.
+	if geometry := reference_geometry(ctx):
+		messages.append({"role": "user", "content": geometry})
+	if brief:
+		build_text = f"Build this page now:\n{brief}"
+		# Vision models get the reference/hero images themselves, not just their
+		# URLs: the user's attached image for THIS turn, plus the brief's marker
+		# images. Text-only models keep working from the marker URLs.
+		image_parts: list[dict] = []
+		if ModelRegistry.supports_vision(ctx.model):
+			image_parts.extend(ctx.images.parts())
+			image_parts.extend(brief_image_parts(brief, skip=ctx.images.file_urls()))
+		if image_parts:
+			messages.append({"role": "user", "content": [{"type": "text", "text": build_text}, *image_parts]})
+		else:
+			messages.append({"role": "user", "content": build_text})
+
+	title = frappe.db.get_value("Builder Page", ctx.page_id, "page_title") if ctx.off_screen else None
+	ctx.emit("progress", message=f"Building {title}…" if title else "Building the page…")
+
+	text = ""
+	finish_reason = None
+	preview = PagePreview(ctx)
+	stream = llm.complete(
+		ctx.model,  # heavy model — generation quality
+		messages,
+		ctx.effort.params("complex"),
+		stream=True,
+		api_key=ctx.api_key,
+		timeout=ctx.effort.stall_timeout,
+	)
+	try:
+		for chunk in stream:
+			if ctx.stop_requested():
+				# Stop, but KEEP: what already streamed is paid-for, visible work.
+				# Fall through to persist the partial page; a cancel ends the turn right
+				# after this step returns, and notes sent now are read before the next round.
+				try:
+					stream.close()
+				except Exception:
+					pass
+				logger.info("generate_page: stopped mid-stream, keeping the partial page")
+				break
+			ctx.record_usage(chunk, model=ctx.model)  # generation streams on the heavy model
+			if not chunk.choices:
+				continue
+			if fr := chunk.choices[0].finish_reason:
+				finish_reason = fr
+			if delta := chunk.choices[0].delta.content:
+				text += delta
+				preview.update(text)
+	finally:
+		# The buffer only serves mid-build refreshes; once this function returns the
+		# draft is persisted (or the turn failed/cancelled) and the DB is the truth.
+		clear_stream_buffer(ctx.page_id)
+
+	if not text.strip() or not ctx.page_id:
+		logger.warning("generate_page: nothing to persist (model=%s, page=%s)", ctx.model, ctx.page_id)
+		return []
+
+	from builder.ai import page_writer
+
+	errors: list[str] = []
+	root, data_script = page_writer.persist_page(ctx.page_id, text, errors)
+	ctx.generation_errors = errors
+	log_generation_quality(ctx.model, finish_reason, text, root)
+	# The raw output, for diagnosing a page that came out thin or missing pieces.
+	dump = frappe.get_site_path("private", "files", f"ai-generation-{ctx.page_id}.txt")
+	try:
+		with open(dump, "w") as f:  # nosemgrep
+			f.write(text)
+	except OSError:
+		dump = "<unwritable>"
+	if errors:
+		logger.warning("generate_page: %d line(s) dropped, first: %s (raw: %s)", len(errors), errors[0], dump)
+	if root is None:
+		logger.warning(
+			"generate_page: markup produced no blocks (model=%s), raw saved to %s", ctx.model, dump
+		)
+		return []
+	return [{"tool_name": "generate_page", "args": {"blocks": [root], "data_script": data_script}}]

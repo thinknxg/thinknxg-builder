@@ -1,11 +1,9 @@
-import frappe
-
 app_name = "builder"
 app_title = "thinkNXG Builder"
 app_publisher = "thinkNXG Technologies Pvt Ltd"
 app_description = "An easier way to build web pages for your needs!"
 app_email = "suraj@frappe.io"
-app_license = "GNU Affero General Public License v3.0"
+app_license = "MIT"
 
 # Includes in <head>
 # ------------------
@@ -31,8 +29,8 @@ require_type_annotated_api_methods = True
 # page_js = {"page" : "public/js/file.js"}
 
 # include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
-# doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
+doctype_js = {"Web Page": "public/js/web_page.js"}
+doctype_list_js = {"Web Page": "public/js/web_page_list.js"}
 # doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
 # doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
 
@@ -76,7 +74,7 @@ after_app_install = "builder.install.after_app_install"
 # Uninstallation
 # ------------
 
-# before_uninstall = "builder.uninstall.before_uninstall"
+before_uninstall = "builder.install.before_uninstall"
 # after_uninstall = "builder.uninstall.after_uninstall"
 
 # Desk Notifications
@@ -97,6 +95,14 @@ after_app_install = "builder.install.after_app_install"
 # "Event": "frappe.desk.doctype.event.event.has_permission",
 # }
 
+user_invitation = {
+	"allowed_roles": {
+		"System Manager": ["Website Manager"],
+		"Website Manager": ["Website Manager"],
+	},
+	"after_accept": ["builder.user_invitation.after_accept"],
+}
+
 # DocType Class
 # ---------------
 # Override standard doctype classes
@@ -109,13 +115,11 @@ after_app_install = "builder.install.after_app_install"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# "*": {
-# "on_update": "method",
-# "on_cancel": "method",
-# "on_trash": "method"
-# }
-# }
+doc_events = {
+	"User Invitation": {
+		"after_insert": "builder.user_invitation.capture_user_invited",
+	}
+}
 
 # Scheduled Tasks
 # ---------------
@@ -189,12 +193,6 @@ scheduler_events = {
 # "builder.auth.validate"
 # ]
 
-builder_path = frappe.conf.builder_path or "builder"
-website_route_rules = [
-	{"from_route": f"/{builder_path}/<path:app_path>", "to_route": "_builder"},
-	{"from_route": f"/{builder_path}", "to_route": "_builder"},
-]
-
 website_path_resolver = "builder.builder.doctype.builder_page.builder_page.resolve_path"
 page_renderer = "builder.builder.doctype.builder_page.builder_page.BuilderPageRenderer"
 
@@ -211,7 +209,12 @@ add_to_apps_screen = [
 		"name": "builder",
 		"logo": "/assets/builder/images/thinknxg_logo.png",
 		"title": "thinkNXG Builder",
-		"route": f"/{builder_path}",
+		# builder_path is per-site config, a hook value is shared by every site on the bench
+		"route": "/api/method/builder.api.open_editor",
 		"has_permission": "builder.api.check_app_permission",
 	}
 ]
+
+# Expose method source code through the API discovery endpoints. Safe for open
+# source apps and helps API clients understand what a method does.
+expose_discovery_source = True

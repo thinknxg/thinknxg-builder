@@ -1,4 +1,4 @@
-# Copyright (c) 2023, Frappe Technologies Pvt Ltd and contributors
+# Copyright (c) 2023, thinkNXG Technologies Pvt Ltd and contributors
 # For license information, please see license.txt
 
 import os
@@ -9,10 +9,15 @@ from frappe.model.document import Document
 from frappe.modules.export_file import export_to_files
 from frappe.utils import get_files_path
 from frappe.utils.telemetry import capture
+from frappe.website.utils import clear_cache
 from jsmin import jsmin
 
+from builder.export_import_standard_page import StandardFileSync
+from builder.utils import is_bulk_import
 
-class BuilderClientScript(Document):
+
+class BuilderClientScript(StandardFileSync, Document):
+	export_subdir = "client_scripts"
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -35,9 +40,47 @@ class BuilderClientScript(Document):
 	def on_update(self):
 		self.update_script_file()
 		self.update_exported_script()
+		self.export_standard_files()
+		self.clear_page_cache()
+
+	def clear_page_cache(self):
+		# cached pages link the previous file version
+		for page in self.get_referencing_pages(fields=["route"]):
+			clear_cache(page.route)
 
 	def on_trash(self):
 		self.delete_script_file()
+		self.delete_standard_exported_files()
+
+	def export_standard_files(self) -> None:
+		if not frappe.conf.developer_mode or is_bulk_import():
+			return
+		from builder.export_import_standard_page import export_client_scripts
+
+		for app in self.referencing_apps:
+			client_scripts_path = os.path.join(frappe.get_app_path(app), "builder_files", "client_scripts")
+			export_client_scripts([self.name], client_scripts_path)
+
+	def get_referencing_pages(
+		self, filters: dict | None = None, fields: list[str] | None = None
+	) -> list[dict]:
+		"""Return the pages that use this script.
+
+		Args:
+		filters: Filters to apply to the pages.
+		fields: Fields to return from the pages.
+		"""
+		refs = frappe.get_all(
+			"Builder Page Client Script",
+			filters={"builder_script": self.name},
+			fields=["parent"],
+		)
+
+		filters = filters or {}
+		filters["name"] = ["in", [ref.parent for ref in refs]]
+		fields = fields or ["name"]
+		pages = frappe.get_all("Builder Page", filters=filters, fields=fields)
+		return pages
 
 	def update_script_file(self):
 		script_type = self.script_type or ""

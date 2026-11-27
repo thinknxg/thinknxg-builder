@@ -1,0 +1,698 @@
+"""Whitelisted endpoints for Builder AI.
+
+A single conversational entry point — `run` — drives the unified agent loop for
+everything (generation, editing, scripts, clarification). The remaining
+endpoints are flow-agnostic session/model helpers.
+"""
+
+import logging
+
+import frappe
+from frappe import _
+from frappe.utils.telemetry import capture
+
+from builder.ai.agent.loop import run_agent_job
+from builder.ai.agent.page_changes import page_row
+from builder.ai.attachments import TurnImages
+from builder.ai.discovery import Discovery
+from builder.ai.llm import Effort, resolve_api_key, settings_api_key
+from builder.ai.models import GatewayListing, ModelRegistry, fetch_credits
+from builder.ai.presets import get_credits_url, get_site_ai_key
+from builder.ai.session import AISession
+from builder.utils import has_page_write
+
+logger = frappe.logger("builder.ai.api")
+logger.setLevel(logging.INFO)
+
+
+@frappe.whitelist()
+@has_page_write()
+def run(
+	prompt: str,
+	page_id: str,
+	model: str | None = None,
+	session_id: str | None = None,
+	selected_block_ids: list | None = None,
+	images: list | None = None,
+	selected_block_context: list | None = None,
+	display_text: str | None = None,
+	canvas_theme: str | None = None,
+	effort: str | None = None,
+):
+	"""Single entry point: run the agent for one user turn of the in-editor chat.
+
+	The server edits the page authoritatively from draft_blocks and mirrors the
+	accepted ops to the canvas.
+	"""
+	logger.info(f"run: page_id={page_id}, model={model}, session_id={session_id}")
+
+	attached = TurnImages.from_request(images)
+	canvas_theme = canvas_theme if canvas_theme in ("light", "dark") else None
+	thinking = Effort(effort)
+
+	# Guard concurrency for an established session first — nothing may persist on the
+	# busy path. The worker takes the atomic run lock; this check just gives a fast
+	# 429 instead of a queued rejection.
+	if session_id and AISession.is_session_running(session_id):
+		frappe.throw(_("Another AI request is still processing. Please wait."), frappe.TooManyRequestsError)
+
+	attached.save()
+
+	if not session_id:
+		session_id = AISession.create({"page": page_id}, model).name
+
+	if session_id:
+		session = AISession.get(session_id, page_id=page_id)
+		session.move_to(page_id)
+		# each message keeps the page it was sent from, since a chat goes on across pages
+		msg_meta: dict = {"selectedBlockContext": selected_block_context or [], "page": page_row(page_id)}
+		if canvas_theme:
+			msg_meta["canvasTheme"] = canvas_theme
+		if thinking.level:
+			msg_meta["effort"] = thinking.level
+		if attached:
+			msg_meta["attachedImages"] = attached.metadata()
+		# A card-composed reply (option tap, form submit) shows as this compact line
+		# in the chat; the full labelled text stays the message content for the model.
+		if display_text:
+			msg_meta["displayText"] = display_text.strip()[:300]
+		session.append_message("user", prompt, message_type="chat", task_type="agent", metadata=msg_meta)
+
+	resolved_model = ModelRegistry.get_default(model or "openrouter")
+	if not ModelRegistry.is_known_model(resolved_model):
+		frappe.throw(_("Unknown AI model: {0}").format(resolved_model))
+	if attached and not ModelRegistry.supports_vision(resolved_model):
+		frappe.throw(
+			_("{0} can't view images. Pick a vision-capable model or remove the attachments.").format(
+				resolved_model
+			)
+		)
+	# Fails fast on a missing key; the job resolves its own copy so the key never sits in the queue.
+	resolve_api_key(resolved_model)
+
+	# Background queue (not now=True): a streaming generation can run 30-60s, and
+	# now=True would hold this web worker open for the entire stream — exhausting the
+	# worker pool under concurrency. Realtime events flow over Redis pub/sub regardless
+	# of which process runs the job.
+	frappe.enqueue(
+		run_agent_job,
+		queue="default",
+		timeout=thinking.job_timeout,
+		prompt=prompt,
+		model=resolved_model,
+		user=frappe.session.user,
+		page_id=page_id,
+		session_id=session_id,
+		enqueue_after_commit=True,
+		selected_block_ids=selected_block_ids,
+		images=attached.payload(),
+		canvas_theme=canvas_theme,
+		effort=thinking.level,
+	)
+	capture("builder_ai_used", "builder")
+	frappe.local.response.http_status_code = 202
+	return {"status": "accepted", "session_id": session_id}
+
+
+def ensure_session_owner(session_id: str) -> None:
+	owner = frappe.db.get_value(AISession.DOCTYPE, session_id, "session_user")
+	if not owner:
+		frappe.throw(_("Session not found"))
+	if owner != frappe.session.user and "System Manager" not in frappe.get_roles():
+		frappe.throw(_("This chat belongs to another user"), frappe.PermissionError)
+
+
+@frappe.whitelist()
+def confirm_pending_settings(message_id: str, decision: str = "apply", skip: list | None = None):
+	"""Apply (or skip) a sensitive action the agent proposed. The privileged write runs
+	HERE, on this user-triggered call — never inside the model's turn. Reads the stored
+	payload off the pending-action message and dispatches to apply_pending_action.
+	`skip` names the rows of a page card the user unticked."""
+	from builder.ai.agent.pending import apply_pending_action
+
+	if not message_id or not frappe.db.exists(AISession.MESSAGE_DOCTYPE, message_id):
+		frappe.throw(_("Pending action not found"))
+
+	msg = frappe.get_doc(AISession.MESSAGE_DOCTYPE, message_id)
+	owner = frappe.db.get_value(AISession.DOCTYPE, msg.session, "session_user")
+	if owner != frappe.session.user:
+		frappe.throw(_("This action does not belong to you"), frappe.PermissionError)
+	if msg.status != "pending_action":
+		frappe.throw(_("No pending action on this message"))
+	meta = AISession.load_metadata(msg.metadata_json)
+	# Page changes check each page's own permission as they apply.
+	on_pages = meta.get("kind") == "page_changes"
+	if not on_pages and not frappe.has_permission("Builder Settings", "write"):
+		frappe.throw(_("You are not permitted to apply this change"), frappe.PermissionError)
+
+	if decision != "apply":
+		frappe.db.set_value(AISession.MESSAGE_DOCTYPE, message_id, "status", "action_skipped")
+		outcome = "Skipped. Nothing was changed."
+		# a page card shows its own outcome, so its status line is for the model only
+		answers = {"card": msg.name} if on_pages else None
+		AISession.try_append_message(
+			msg.session, "assistant", outcome, message_type="status", metadata=answers
+		)
+		# A page card comes once the turn's work is done; only approved pages it held back go on.
+		if on_pages:
+			resumed = queue_page_build(msg.session, meta.get("next_builds") or [])
+		else:
+			resumed = resume_after_action(msg.session, outcome)
+		return {"status": "skipped", "resumed": resumed}
+
+	if on_pages:
+		return confirm_page_changes(msg, meta, skip)
+	result = apply_pending_action(meta.get("kind"), meta.get("payload") or {})
+	frappe.db.set_value(AISession.MESSAGE_DOCTYPE, message_id, "status", "action_applied")
+	# The OUTCOME becomes part of the conversation — visible in the chat after a
+	# reload, and context for the agent's next turn (it knows what was applied).
+	AISession.try_append_message(msg.session, "assistant", result, message_type="status")
+	resumed = resume_after_action(msg.session, result)
+	return {"status": "applied", "message": result, "resumed": resumed}
+
+
+def confirm_page_changes(msg, meta: dict, skip: list | None = None) -> dict:
+	"""Apply a page card. Each page's result lands on the card itself, and new pages are
+	built next, one turn each, with the chat staying on the page it belongs to."""
+	from builder.ai.agent.page_changes import apply_page_changes
+
+	if AISession.is_session_running(msg.session):
+		frappe.throw(_("Bob is still working. Apply this once the current reply is done."))
+	outcome, pages = apply_page_changes(meta.get("payload") or {}, skip)
+	AISession.answer_card(msg.name, "action_applied", {**meta, "results": pages})
+	# the pages it changed list this chat, so opening one of them carries on here
+	changed = [p["page_id"] for p in pages if p["status"] in ("created", "changed")]
+	AISession(frappe.get_doc(AISession.DOCTYPE, msg.session)).add_pages(*changed)
+	AISession.try_append_message(
+		msg.session,
+		"assistant",
+		outcome,
+		message_type="status",
+		metadata={"card": msg.name, "pageMarks": page_marks(changed)},
+	)
+	created = [p for p in pages if p["status"] == "created"]
+	resumed = queue_page_build(msg.session, [*(meta.get("next_builds") or []), *created])
+	return {"status": "applied", "message": outcome, "pages": pages, "resumed": resumed}
+
+
+def page_marks(page_ids: list[str]) -> dict[str, str]:
+	"""How the card left each page, so this chat's next turn on one tells the user's
+	later edits from these."""
+	from builder.ai.markup import page_mark
+	from builder.ai.page_writer import load_page_root
+
+	return {page_id: page_mark(load_page_root(page_id)) for page_id in page_ids}
+
+
+def resume_after_action(session_id: str, outcome: str) -> bool:
+	"""Carry on with the plan once a confirm-gated action has been decided.
+
+	A confirm card authorises a step, it does not change the plan, so ending the turn
+	there left the user typing "continue" to re-trigger the job. Best effort: the
+	action is already applied and must not be undone by a queue failure.
+	"""
+	if AISession.is_session_running(session_id):
+		return False
+	# run_agent_job does not persist its prompt, so no phantom "continue" in the chat
+	return continue_session(
+		session_id, f"{outcome}\n\nContinue with what you were doing. Do not repeat this step."
+	)
+
+
+def queue_page_build(session_id: str, builds: list[dict], user: str | None = None) -> bool:
+	"""Build the first of the approved new pages off-screen; its turn hands on the rest."""
+	if not builds:
+		return False
+	page = builds[0]
+	prompt = (
+		f"The user approved the new page “{page['title']}” ({page['route']}). It now exists and is "
+		"empty. Build it now: it is your working page this turn. They already said yes, so don't ask "
+		"anything first and keep its title and route; read the site pages you need to match, then "
+		"build it from the brief you "
+		f"proposed:\n{page.get('brief') or '(no brief, use the conversation)'}\n\n"
+		"Finish with a short summary of what you built."
+	)
+	return continue_session(session_id, prompt, page_id=page["page_id"], next_builds=builds[1:], user=user)
+
+
+def continue_session(session_id: str, prompt: str, page_id: str | None = None, **job) -> bool:
+	"""Queue a turn the server starts itself, on the session's model and effort. The
+	chat stays on the session's page; `page_id` is the page that turn works on."""
+	try:
+		open_page, model = frappe.db.get_value(AISession.DOCTYPE, session_id, ["page", "selected_model"])
+		if not open_page:
+			return False
+		resolved_model = ModelRegistry.get_default(model or "openrouter")
+		# A job that can't find its key fails out of sight, so check before queueing it.
+		resolve_api_key(resolved_model)
+		turn = AISession.latest_turn_metadata(session_id)
+		thinking = Effort(turn.get("effort"))
+		frappe.enqueue(
+			run_agent_job,
+			queue="default",
+			timeout=thinking.job_timeout,
+			prompt=prompt,
+			model=resolved_model,
+			user=job.pop("user", None) or frappe.session.user,
+			page_id=page_id or open_page,
+			open_page_id=open_page,
+			session_id=session_id,
+			canvas_theme=turn.get("canvasTheme"),
+			effort=thinking.level,
+			enqueue_after_commit=True,
+			**job,
+		)
+		return True
+	except Exception:
+		logger.warning(f"could not continue session {session_id}", exc_info=True)
+		return False
+
+
+@frappe.whitelist()
+def steer(session_id: str, prompt: str = "", now: bool = False):
+	"""Queue a message for the running turn; the loop reads it in at its next round,
+	or with `now` drops the step it is on to read it straight away. With no turn
+	running nothing would read it, so the chat sends it as a turn."""
+	ensure_session_owner(session_id)
+	if not (prompt.strip() or now) or not AISession.is_session_running(session_id):
+		return {"status": "not_running"}
+	if prompt.strip():
+		AISession.queue_note(session_id, prompt.strip())
+	if now:
+		AISession.send_notes_now(session_id)
+	return {"status": "queued"}
+
+
+@frappe.whitelist()
+def take_back_notes(session_id: str):
+	"""The notes the running turn hasn't read yet, out of its queue, to edit or drop."""
+	ensure_session_owner(session_id)
+	return {"notes": AISession.pop_notes(session_id)}
+
+
+@frappe.whitelist()
+@has_page_write()
+def cancel(session_id: str):
+	"""Request that the currently-running turn for this session abort at its
+	next stream chunk. The loop closes the LLM stream — Anthropic / OpenRouter
+	stop billing for further tokens once the connection drops."""
+	from builder.ai import locks
+	from builder.ai.agent.loop import EVENT_PREFIX
+
+	if not session_id:
+		return {"status": "ok"}
+	ensure_session_owner(session_id)
+	frappe.cache.set_value(f"builder_ai_cancel:{session_id}", "1", expires_in_sec=300)
+	# Only a live loop acknowledges the flag. If no turn holds the session lock
+	# (the run crashed, timed out, or never started), tell the panel directly —
+	# otherwise "Cancelling…" spins forever.
+	if not locks.held(locks.session_key(session_id)):
+		channel = frappe.db.get_value("Builder AI Session", session_id, "page") or session_id
+		frappe.publish_realtime(
+			f"{EVENT_PREFIX}_error_{channel}",
+			{"session_id": session_id, "message": "That run is no longer active."},
+			user=frappe.session.user,
+		)
+		return {"status": "not_running"}
+	return {"status": "ok"}
+
+
+@frappe.whitelist()
+@has_page_write()
+def revert_to_message(session_id: str, message_id: str):
+	"""Rewind the conversation to before the given turn: delete that turn's user
+	prompt, its assistant reply, and every message after it. The page itself is
+	restored separately by the client via the turn's snapshot."""
+	session = AISession.get(session_id)
+	session.truncate_from_turn(message_id)
+	return {"messages": session.get_messages()}
+
+
+PROVIDER_FIELDS = (
+	"provider_name",
+	"route_prefix",
+	"litellm_provider",
+	"api_base",
+	"enabled",
+)
+
+
+@frappe.whitelist()
+def save_ai_provider(provider: dict, name: str | None = None) -> str:
+	"""Create or update a provider from the settings UI. An omitted api_key keeps
+	the stored one: the client never receives it (keys live in __Auth), so without
+	this, editing the API base would wipe the key."""
+	if not frappe.has_permission("Builder AI Provider", "write"):
+		frappe.throw(_("You are not permitted to manage AI providers"), frappe.PermissionError)
+
+	doc = (
+		frappe.get_doc("Builder AI Provider", name)
+		if name and frappe.db.exists("Builder AI Provider", name)
+		else frappe.new_doc("Builder AI Provider")
+	)
+	for field in PROVIDER_FIELDS:
+		if field in provider:
+			doc.set(field, provider[field])
+	if provider.get("api_key"):
+		doc.api_key = provider["api_key"]
+	doc.save()
+	return doc.name
+
+
+@frappe.whitelist()
+def import_provider_models(provider: str) -> dict:
+	"""Add every chat model a gateway advertises at /models, right now rather than
+	on the picker's next sync. Existing rows are left alone, so this is safe to re-run."""
+	if not frappe.has_permission("Builder AI Model", "create"):
+		frappe.throw(_("You are not permitted to manage AI models"), frappe.PermissionError)
+
+	doc = frappe.get_doc("Builder AI Provider", provider)
+	if not doc.api_base:
+		frappe.throw(_("This provider has no API Base to ask"))
+	try:
+		return GatewayListing(doc).sync()
+	except Exception as e:
+		logger.warning(f"import_provider_models failed for {provider}: {e}")
+		frappe.throw(_("Could not reach {0}: {1}").format(doc.api_base, str(e)[:200]))
+
+
+@frappe.whitelist()
+def delete_ai_provider(provider: str) -> None:
+	"""Delete a provider with its models. A provider refuses to go while models still
+	point at it, so they go first, in the same request."""
+	for model in frappe.get_all("Builder AI Model", filters={"provider": provider}, pluck="name"):
+		frappe.delete_doc("Builder AI Model", model)
+	frappe.delete_doc("Builder AI Provider", provider)
+
+
+@frappe.whitelist()
+def sync_ai_models(provider: str | None = None) -> None:
+	"""Pick up models the providers added or retired since the last sync: one
+	provider right now (its errors reach the user), or every gateway, with the
+	stale discovered providers queued so opening /providers never waits on them."""
+	if not frappe.has_permission("Builder AI Model", "create"):
+		return
+	if provider:
+		sync_one_provider(frappe.get_doc("Builder AI Provider", provider))
+		return
+	GatewayListing.sync_all(force=True)
+	Discovery.refresh_in_background()
+
+
+def sync_one_provider(doc) -> None:
+	from builder.ai.presets import readable_error
+
+	discovery = Discovery(doc)
+	try:
+		if doc.api_base:
+			GatewayListing(doc).sync()
+		elif discovery.preset:
+			discovery.sync()
+	except Exception as e:
+		frappe.throw(readable_error(str(e))[0])
+
+
+@frappe.whitelist()
+def get_provider_credits(provider: str) -> dict | None:
+	"""The balance a gateway reports at its credits_url, or None when it reports none."""
+	if not frappe.has_permission("Builder AI Provider", "read"):
+		frappe.throw(_("You are not permitted to view AI providers"), frappe.PermissionError)
+
+	doc = frappe.get_doc("Builder AI Provider", provider)
+	return GatewayListing(doc).credits() if doc.api_base else None
+
+
+@frappe.whitelist()
+def get_site_ai_credits() -> dict | None:
+	"""The balance of the AI credits thinkNXG Cloud gives this site, or None when it gives none."""
+	frappe.has_permission("Builder AI Provider", "read", throw=True)
+	if not (entry := get_site_ai_key(fresh=True)):
+		return None
+	headers = {"Authorization": f"Bearer {entry['api_key']}"}
+	return fetch_credits(get_credits_url(entry["gateway_url"]), headers)
+
+
+@frappe.whitelist()
+@has_page_write()
+def get_ai_models():
+	# a stale list is refreshed behind the picker, which shows what is stored meanwhile
+	GatewayListing.refresh_in_background()
+	Discovery.refresh_in_background()
+	return ModelRegistry.available()
+
+
+@frappe.whitelist()
+@has_page_write()
+def ai_setup_state():
+	"""What the connect menu needs: the providers on offer, and whether anything
+	usable is already connected. Never returns a key."""
+	from builder.ai import presets
+
+	# An install that hasn't migrated has no provider table at all. Say so plainly
+	# rather than raising behind a screen that then renders empty.
+	if not frappe.db.exists("DocType", "Builder AI Provider"):
+		return {"configured": False, "models": 0, "providers": 0, "needs_migrate": True, "presets": []}
+
+	presets.sync_site_provider()
+	providers = frappe.get_all("Builder AI Provider", filters={"enabled": 1}, pluck="name")
+	settings_key = settings_api_key()
+	# A provider carrying its own key is enough on its own — a self-hosted gateway
+	# never needs the shared OpenRouter one.
+	has_key = bool(settings_key) or any(
+		frappe.get_cached_doc("Builder AI Provider", name).resolved_key() for name in providers
+	)
+	return {
+		"configured": has_key and bool(frappe.db.count("Builder AI Model", {"enabled": 1})),
+		"models": frappe.db.count("Builder AI Model", {"enabled": 1}),
+		"providers": len(providers),
+		"presets": [presets.public_preset(p) for p in presets.PRESETS],
+	}
+
+
+@frappe.whitelist()
+@has_page_write()
+def connect_ai_provider(preset: str, api_key: str = ""):
+	"""Connect a provider by its key: checked, saved, and its frontier models found.
+	Returns the provider and the models now on offer, best first."""
+	from builder.ai import presets
+
+	found = presets.find_preset(preset)
+	if not found or found.get("custom") or found.get("oauth"):
+		frappe.throw(_("{0} doesn't connect with a key").format(preset))
+	return presets.connect(found, api_key)
+
+
+@frappe.whitelist()
+@has_page_write()
+def get_addable_models(provider: str):
+	"""Everything a provider serves that Bob could use and isn't offering, newest
+	first: the way to a model the frontier leaves out, like an open-weights one."""
+	from builder.ai.catalog import ProviderCatalog
+	from builder.ai.presets import readable_error
+
+	try:
+		models = ProviderCatalog(frappe.get_doc("Builder AI Provider", provider)).offered()
+	except Exception as e:
+		frappe.throw(readable_error(str(e))[0])
+	return [
+		{
+			"model_id": m["id"],
+			"label": m["label"],
+			"released": m.get("released"),
+			"context": m.get("context"),
+			# unknown for a gateway's models, which nothing describes
+			"vision": "image" in m["input"] if m.get("input") else None,
+		}
+		for m in models
+	]
+
+
+@frappe.whitelist()
+@has_page_write()
+def add_ai_model(provider: str, model_id: str):
+	"""Switch a model on by hand. Discovery never switches it off again."""
+	from builder.ai.catalog import ProviderCatalog
+
+	return ProviderCatalog(frappe.get_doc("Builder AI Provider", provider)).add(model_id)
+
+
+@frappe.whitelist()
+@has_page_write()
+def start_codex_login():
+	"""Begin a ChatGPT sign-in: the code to show, the page to enter it on, and the state to poll."""
+	from builder.ai import codex_login
+	from builder.ai.codex import CodexError
+
+	try:
+		return codex_login.start()
+	except CodexError as e:
+		return {"status": "failed", "message": str(e)}
+
+
+@frappe.whitelist()
+@has_page_write()
+def poll_codex_login(state: str):
+	"""Where a ChatGPT sign-in stands: pending, approved, connected (with its models), failed or expired."""
+	from builder.ai import codex_login
+	from builder.ai.codex import CodexError
+
+	try:
+		return codex_login.poll(state)
+	except CodexError as e:
+		return {"status": "failed", "message": str(e)}
+
+
+@frappe.whitelist()
+@has_page_write()
+def start_codex_browser_login():
+	"""The fallback sign-in, for a workspace without device codes: a link to open,
+	whose localhost redirect the user pastes into finish_codex_login."""
+	from builder.ai import codex_login
+
+	return codex_login.start_browser()
+
+
+@frappe.whitelist()
+@has_page_write()
+def finish_codex_login(redirect_url: str):
+	"""Complete a browser-link sign-in from the pasted redirect URL."""
+	from builder.ai import codex_login
+	from builder.ai.codex import CodexError
+
+	try:
+		return codex_login.finish(redirect_url)
+	except CodexError as e:
+		return {"status": "failed", "message": str(e)}
+
+
+@frappe.whitelist()
+@has_page_write()
+def get_ai_session(page_id: str, model: str | None = None, session_id: str | None = None):
+	"""One page can hold several parallel chat sessions. With `session_id` this loads
+	that specific session; without it, the page's most recently used one. Reading
+	never creates a session: a page nobody has chatted on gets a blank one, and
+	`run` creates the session with the chat's first message."""
+	if not page_id or page_id == "new" or not frappe.db.exists("Builder Page", page_id):
+		return blank_session(page_id, model)
+
+	if not (session_id and AISession.can_open(session_id, page_id)):
+		session_id = AISession.last_used(AISession.on_page(page_id))
+	if not session_id:
+		return blank_session(page_id, model)
+	session = AISession.get(session_id, page_id=page_id)
+	return {
+		"session_id": session.name,
+		"page_id": session.page,
+		"selected_model": session.selected_model,
+		"last_task_type": session.last_task_type,
+		"messages": session.get_messages(),
+		"is_running": AISession.is_session_running(session.name),
+	}
+
+
+def blank_session(page_id: str, model: str | None) -> dict:
+	return {
+		"session_id": "",
+		"page_id": page_id,
+		"selected_model": model or "",
+		"last_task_type": None,
+		"messages": [],
+		"is_running": False,
+	}
+
+
+@frappe.whitelist()
+@has_page_write()
+def list_page_ai_sessions(page_id: str, limit: int = 20):
+	"""This page's chat sessions for the current user — powers the session switcher."""
+	if not page_id or page_id == "new":
+		return []
+	rows = frappe.get_all(
+		AISession.DOCTYPE,
+		filters={**AISession.on_page(page_id), "status": "Active"},
+		fields=["name", "title", "last_interaction_on"],
+		order_by="last_interaction_on desc",
+		limit=min(int(limit), 50),
+	)
+	# A user-set title wins; otherwise the first user message names the session.
+	for r in rows:
+		r["title"] = r["title"] or frappe.db.get_value(
+			AISession.MESSAGE_DOCTYPE,
+			{"session": r["name"], "role": "user"},
+			"content",
+			order_by="creation asc",
+		)
+	return rows
+
+
+@frappe.whitelist()
+@has_page_write()
+def delete_ai_session(session_id: str):
+	ensure_session_owner(session_id)
+	# The session's on_trash takes its messages with it.
+	frappe.delete_doc(AISession.DOCTYPE, session_id, ignore_permissions=True)
+	return {"status": "ok"}
+
+
+@frappe.whitelist()
+@has_page_write()
+def update_session_message_metadata(session_id: str, metadata: dict):
+	"""Persist client-side metadata (affectedBlocks, affectedScripts) onto the last
+	assistant message so it survives page reloads."""
+	if not session_id or not frappe.db.exists(AISession.DOCTYPE, session_id):
+		return
+	session = AISession.get(session_id)  # asserts ownership
+	safe_meta = {k: metadata[k] for k in ("affectedBlocks", "affectedScripts") if k in metadata}
+	session.update_last_assistant_metadata(safe_meta)
+
+
+@frappe.whitelist()
+@has_page_write()
+def test_api_key(provider: str | None = None, api_key: str | None = None):
+	"""Call the cheapest model this key can reach and report what happened. With a
+	provider, tests THAT provider's key and one of its models (or `api_key`, a key
+	typed into its form but not saved yet); without, the OpenRouter key in Builder
+	Settings."""
+	typed_key = api_key if provider else None
+	if provider:
+		model = frappe.db.get_value("Builder AI Model", {"provider": provider, "enabled": 1}, "name")
+		if not model:
+			return {"success": False, "message": _("Add a model to this provider first")}
+		actual_model = model
+		api_key = typed_key or resolve_api_key(model)
+	else:
+		api_key = settings_api_key()
+		if not api_key:
+			return {"success": False, "message": _("Please set an OpenRouter API key")}
+		actual_model = ModelRegistry.get_default("openrouter")
+
+	import litellm
+
+	from builder.ai.llm import route
+
+	# route() prefers the provider's stored key, and the typed one is what's under test
+	call_model, overrides, routed_key = route(actual_model, api_key)
+	try:
+		litellm.completion(
+			model=call_model,
+			**overrides,
+			messages=[{"role": "user", "content": "Say 'OK' if you can read this"}],
+			max_tokens=10,
+			api_key=typed_key or routed_key,
+			drop_params=True,
+		)
+		return {"success": True, "message": _("API key is valid")}
+	except Exception as e:
+		logger.error(f"test_api_key failed: {e!s}", exc_info=True)
+		return {"success": False, "message": str(e)}
+
+
+@frappe.whitelist()
+@has_page_write()
+def get_active_build(page_id: str):
+	"""The in-flight generation stream for this page, so an editor that loads (or
+	refreshes) mid-build replays the live preview instead of the stale draft."""
+	from builder.ai.agent.artifact import stream_buffer_key
+
+	raw = frappe.cache().get_value(stream_buffer_key(page_id))
+	return frappe.parse_json(raw) if raw else None

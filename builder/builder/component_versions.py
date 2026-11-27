@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Frappe Technologies Pvt Ltd and contributors
+# Copyright (c) 2026, thinkNXG Technologies Pvt Ltd and contributors
 # For license information, please see license.txt
 
 """Version-pinned Builder Component dependencies for pages.

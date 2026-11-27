@@ -1,5 +1,36 @@
 @import "frappe-ui/style.css";
 
+/* The same files published pages load, rather than the build's hashed copies of them,
+   so the editor, its canvas and any page the visitor came from share one download. */
+@font-face {
+	font-family: InterVar;
+	font-weight: 100 900;
+	font-display: swap;
+	font-style: normal;
+	src: url("/assets/builder/fonts/Inter/Inter.var.woff2?v=3.19") format("woff2");
+}
+@font-face {
+	font-family: InterVar;
+	font-weight: 100 900;
+	font-display: swap;
+	font-style: italic;
+	src: url("/assets/builder/fonts/Inter/Inter-Italic.var.woff2?v=3.19") format("woff2");
+}
+@font-face {
+	font-family: Inter;
+	font-weight: 100 900;
+	font-display: swap;
+	font-style: normal;
+	src: url("/assets/builder/fonts/Inter/Inter.var.woff2?v=3.19") format("woff2");
+}
+@font-face {
+	font-family: Inter;
+	font-weight: 100 900;
+	font-display: swap;
+	font-style: italic;
+	src: url("/assets/builder/fonts/Inter/Inter-Italic.var.woff2?v=3.19") format("woff2");
+}
+
 @layer base {
 	ul,
 	ol {
@@ -67,9 +98,15 @@ p:empty::before {
 }
 
 /* surface-base resolves to dark-gray-950 (#171717); pin it to the deeper
-   gray-950 (#0f0f0f) in dark mode for a darker base/page background. */
-[data-theme='dark'] .bg-surface-base {
+   gray-950 (#0f0f0f) in dark mode for a darker base/page background. A ticked
+   checkbox keeps its fill: :where adds no specificity, so the dialog rule below still wins. */
+[data-theme='dark'] .bg-surface-base:not(:where(:checked, :indeterminate)) {
 	background-color: var(--gray-950);
+}
+
+/* Dialogs keep surface-base, so Builder's settings match the Cloud Settings panels shown inside them. */
+[data-theme='dark'] [role='dialog'] .bg-surface-base {
+	background-color: var(--surface-base);
 }
 
 [contenteditable=true]:focus-visible {
@@ -82,4 +119,10 @@ p:empty::before {
    DraggablePopup (z-20) so e.g. color pickers opened from within popups stay visible */
 .PopoverContent {
 	z-index: 30;
+}
+
+/* frappe-ui v1.0.0-beta.21 dimmed Switch labels to the shared InputLabel default
+   (ink-gray-5); restore the old emphasis since the label acts as the row title */
+div:has(> [role='switch']) label[data-slot='label'] {
+	@apply font-medium text-ink-gray-8;
 }

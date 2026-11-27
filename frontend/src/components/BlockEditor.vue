@@ -17,8 +17,9 @@
 			:on-update="updateTracker"
 			:disable-handlers="false"
 			:breakpoint="breakpoint" />
-		<MarginHandler
-			v-show="showMarginHandler"
+		<GapHandler
+			:data-block-id="block.blockId"
+			v-if="showGapHandler"
 			:target-block="block"
 			:target="target"
 			:on-update="updateTracker"
@@ -29,7 +30,17 @@
 			v-if="showBorderRadiusHandler"
 			:target-block="block"
 			:target="target" />
-		<BoxResizer v-if="showResizer" :targetBlock="block" @resizing="resizing = $event" :target="target" />
+		<RotationHandler
+			v-if="showResizer && !resizing"
+			:target-block="block"
+			:target="target"
+			@rotating="rotating = $event" />
+		<BoxResizer
+			v-if="showResizer && !rotating"
+			:targetBlock="block"
+			@resizing="resizing = $event"
+			:target="target" />
+		<PinLines v-if="showPinLines" :block="block" :target="target" />
 	</div>
 </template>
 <script setup lang="ts">
@@ -37,14 +48,17 @@ import type Block from "@/block";
 import useBuilderStore from "@/stores/builderStore";
 import useCanvasStore from "@/stores/canvasStore";
 import blockController from "@/utils/blockController";
-import { addPxToNumber } from "@/utils/helpers";
+import BlockPosition from "@/utils/blockPosition";
+import { isReorderable, startBlockReorder } from "@/utils/useBlockReorder";
 import { Ref, computed, inject, nextTick, onMounted, ref, watch, watchEffect } from "vue";
 import setGuides from "../utils/guidesTracker";
 import trackTarget from "../utils/trackTarget";
 import BorderRadiusHandler from "./BorderRadiusHandler.vue";
 import BoxResizer from "./BoxResizer.vue";
-import MarginHandler from "./MarginHandler.vue";
+import GapHandler from "./GapHandler.vue";
 import PaddingHandler from "./PaddingHandler.vue";
+import PinLines from "./PinLines.vue";
+import RotationHandler from "./RotationHandler.vue";
 
 const canvasProps = inject("canvasProps") as CanvasProps;
 const canvasStore = useCanvasStore();
@@ -52,6 +66,7 @@ const builderStore = useBuilderStore();
 
 const showResizer = computed(() => {
 	return (
+		builderStore.mode === "select" &&
 		!props.block.isRoot() &&
 		!props.editable &&
 		!props.readonly &&
@@ -83,14 +98,16 @@ const props = withDefaults(
 const editor = ref(null) as unknown as Ref<HTMLElement>;
 const updateTracker = ref(() => {});
 const resizing = ref(false);
+const rotating = ref(false);
+const transforming = computed(() => resizing.value || rotating.value);
 const guides = setGuides(props.target, canvasProps);
 const moving = ref(false);
-const preventCLick = ref(false);
-
+const preventClick = ref(false);
 const showPaddingHandler = computed(() => {
 	return (
+		builderStore.mode === "select" &&
 		isBlockSelected.value &&
-		!resizing.value &&
+		!transforming.value &&
 		!canvasStore.isDragging &&
 		!props.editable &&
 		!props.readonly &&
@@ -100,21 +117,23 @@ const showPaddingHandler = computed(() => {
 	);
 });
 
-const showMarginHandler = computed(() => {
+// A gap needs two children to sit between. Whether the block is actually a flex or grid
+// container is decided inside the handler, off the rendered display — isFlex()/isGrid()
+// read only the block's own styles and miss a layout that comes from a CSS class.
+const showGapHandler = computed(() => {
 	return (
-		isBlockSelected.value &&
-		!props.block.isRoot() &&
-		!canvasStore.isDragging &&
-		!resizing.value &&
-		!props.editable &&
-		!props.readonly &&
-		!blockController.multipleBlocksSelected() &&
-		(!props.block.isText() || (props.block.isLink() && props.block.hasChildren()))
+		showPaddingHandler.value &&
+		(props.block.getChildren().length > 1 ||
+			(props.target && (props.target as HTMLElement).childElementCount > 1))
 	);
 });
 
+// what a free block is pinned to, as lines out to its container
+const showPinLines = computed(() => showResizer.value && movable.value && !rotating.value);
+
 const showBorderRadiusHandler = computed(() => {
 	return (
+		builderStore.mode === "select" &&
 		isBlockSelected.value &&
 		!props.block.isRoot() &&
 		!props.block.isText() &&
@@ -122,7 +141,7 @@ const showBorderRadiusHandler = computed(() => {
 		!props.block.isSVG() &&
 		!props.editable &&
 		!props.readonly &&
-		!resizing.value &&
+		!transforming.value &&
 		!canvasStore.isDragging &&
 		!blockController.multipleBlocksSelected()
 	);
@@ -134,7 +153,6 @@ watchEffect(() => {
 	props.block.getStyle("bottom");
 	props.block.getStyle("right");
 	props.block.getStyle("position");
-	props.block.rawStyles;
 	const parentBlock = props.block.getParentBlock();
 	parentBlock?.getStyle("display");
 	parentBlock?.getStyle("justifyContent");
@@ -173,15 +191,23 @@ const getStyleClasses = computed(() => {
 	} else {
 		classes.push("ring-blue-400");
 	}
+	// hover editors mount later, so without this their ring paints over the selection's handles
+	if (isBlockSelected.value) {
+		classes.push("z-10");
+	}
 	if (
 		isBlockSelected.value &&
+		builderStore.mode === "select" &&
 		!props.editable &&
 		!props.readonly &&
 		!props.block.isRoot() &&
 		!props.block.isRepeater() &&
 		!canvasStore.isDragging
 	) {
-		// make editor interactive
+		// make editor interactive — ONLY in select mode. In draw modes
+		// (container/text/image/repeater) or pan (move) the overlay must stay
+		// transparent so the press falls through to the canvas (e.g. to draw a
+		// container INSIDE this block instead of reordering it).
 		classes.push("pointer-events-auto");
 	}
 	return classes;
@@ -200,14 +226,17 @@ const movable = computed(() => {
 	return props.block.isMovable() && !props.readonly;
 });
 
+// In-flow blocks that can be reordered via the pointer-based reorder engine.
+const reorderable = computed(() => !props.readonly && isReorderable(props.block));
+
 onMounted(() => {
 	updateTracker.value = trackTarget(props.target, editor.value, canvasProps);
 });
 
 const handleClick = (ev: MouseEvent) => {
 	if (props.editable || props.readonly) return;
-	if (preventCLick.value) {
-		preventCLick.value = false;
+	if (preventClick.value) {
+		preventClick.value = false;
 		return;
 	}
 
@@ -237,7 +266,7 @@ const handleDrop = (ev: DragEvent) => {
 
 const handleDoubleClick = (ev: MouseEvent) => {
 	if (props.readonly) return;
-	if (props.block.isHTML()) {
+	if (props.block.isHTML() || props.block.isInlineSVG()) {
 		canvasStore.editHTML(props.block);
 		return;
 	}
@@ -252,14 +281,28 @@ const handleMove = (ev: MouseEvent) => {
 	if (builderStore.mode === "text") {
 		canvasStore.editableBlock = props.block;
 	}
+
+	// Reorder / free-move are select-mode only. In draw modes (container, image,
+	// repeater) or pan (move) the press must fall through to the canvas so you can
+	// draw inside this block instead of dragging it.
+	if (builderStore.mode !== "select") return;
+
+	// In-flow blocks reorder via the pointer engine; absolutely-positioned ones
+	// fall through to the free-move handler below.
+	if (reorderable.value) {
+		ev.stopPropagation();
+		startBlockReorder(ev, props.block, props.breakpoint);
+		return;
+	}
+
 	if (!movable.value || props.block.isRoot()) return;
 	ev.stopPropagation();
 	const pauseId = canvasStore.activeCanvas?.history?.pause();
 	const target = ev.target as HTMLElement;
 	const startX = ev.clientX;
 	const startY = ev.clientY;
-	const startLeft = (props.target as HTMLElement).offsetLeft || 0;
-	const startTop = (props.target as HTMLElement).offsetTop || 0;
+	// moves the sides the block is pinned to, each in the unit it is written in
+	const moveBy = new BlockPosition(props.block, props.target as HTMLElement).startMove();
 
 	moving.value = true;
 	guides.showX();
@@ -274,21 +317,18 @@ const handleMove = (ev: MouseEvent) => {
 		const scale = canvasProps.scale;
 		const movementX = (mouseMoveEvent.clientX - startX) / scale;
 		const movementY = (mouseMoveEvent.clientY - startY) / scale;
-		let finalLeft = startLeft + movementX;
-		let finalTop = startTop + movementY;
-		props.block.setStyle("left", addPxToNumber(finalLeft));
-		props.block.setStyle("top", addPxToNumber(finalTop));
+		moveBy(movementX, movementY);
 		await nextTick();
 		const { leftOffset, rightOffset } = guides.getPositionOffset();
 		if (leftOffset !== 0) {
-			props.block.setStyle("left", addPxToNumber(finalLeft + leftOffset));
+			moveBy(movementX + leftOffset, movementY);
 		}
 		if (rightOffset !== 0) {
-			props.block.setStyle("left", addPxToNumber(finalLeft + rightOffset));
+			moveBy(movementX + rightOffset, movementY);
 		}
 
 		mouseMoveEvent.preventDefault();
-		preventCLick.value = true;
+		preventClick.value = true;
 	};
 	document.addEventListener("mousemove", mousemove);
 	document.addEventListener(

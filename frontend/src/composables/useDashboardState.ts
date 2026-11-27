@@ -1,5 +1,5 @@
 import { useStorage } from "@vueuse/core";
-import { ref, Ref } from "vue";
+import { computed, ref, Ref } from "vue";
 
 const searchFilter = ref("");
 const selectionMode = ref(false);
@@ -10,8 +10,24 @@ const showTemplatesDialog = ref(false);
 // remembers the template group the picker was last drilled into ("" = gallery)
 const lastTemplateGroup = useStorage("lastTemplateGroup", "") as Ref<string>;
 
+// active category filter in the template gallery ("" = All)
+const templateCategoryFilter = useStorage("templateCategoryFilter", "") as Ref<string>;
+
 const displayType = useStorage("displayType", "grid") as Ref<"grid" | "list" | "tree">;
-const typeFilter = useStorage("typeFilter", "") as Ref<"" | "draft" | "published" | "unpublished" | "all">;
+// a fresh key: values saved under the old "typeFilter" key (published/unpublished) no longer exist
+const statusFilter = useStorage("pageStatusFilter", "") as Ref<
+	"" | "all" | "live" | "staging" | "draft" | "unpublished_changes"
+>;
+const accessFilter = useStorage("pageAccessFilter", "all") as Ref<"all" | "public" | "protected">;
+const createdByFilter = useStorage("pageCreatedByFilter", "") as Ref<string>;
+const activeFilterCount = computed(
+	() =>
+		[
+			!["", "all"].includes(statusFilter.value),
+			accessFilter.value !== "all",
+			Boolean(createdByFilter.value),
+		].filter(Boolean).length,
+);
 const orderBy = useStorage("orderBy", "creation") as Ref<
 	"creation" | "modified" | "alphabetically_a_z" | "alphabetically_z_a"
 >;
@@ -27,8 +43,12 @@ export function useDashboardState() {
 		treeExpanded,
 		showTemplatesDialog,
 		lastTemplateGroup,
+		templateCategoryFilter,
 		displayType,
-		typeFilter,
+		statusFilter,
+		accessFilter,
+		createdByFilter,
+		activeFilterCount,
 		orderBy,
 		expandTreeFn,
 		collapseTreeFn,

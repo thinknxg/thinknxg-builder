@@ -1,26 +1,31 @@
 import useCanvasStore from "@/stores/canvasStore";
 import useComponentStore from "@/stores/componentStore";
-import { findBlockInTree, resetBlock } from "@/utils/block/tree";
 import {
 	extendWithComponent,
 	rebuildWithComponent,
 	resetWithComponent,
 	syncBlockWithComponent,
 } from "@/utils/block/componentInstance";
+import { findBlockInTree, resetBlock } from "@/utils/block/tree";
+import BlockPosition from "@/utils/blockPosition";
+import type { SpacingType } from "@/utils/cssUtils";
 import {
 	addPxToNumber,
 	cssUrl,
+	dataURLFileName,
 	dataURLtoFile,
 	generateId,
 	getBlockCopy,
 	getBlockInstance,
-	getBoxSpacing,
 	getNumberFromPx,
+	getSpacing,
 	getTextContent,
 	handleBase64Attribute,
+	isHTMLString,
 	kebabToCamelCase,
 	parseAndSetBackground,
-	setBoxSpacing,
+	setSpacing,
+	toStyleProperty,
 	uploadBuilderAsset,
 } from "@/utils/helpers";
 import { Editor } from "@tiptap/vue-3";
@@ -45,17 +50,60 @@ const TEXT_ELEMENTS = new Set([
 	"em",
 	"i",
 	"blockquote",
+	"summary",
 ]);
 
 const CONTAINER_ELEMENTS = new Set(["section", "div"]);
 
 const HEADER_ELEMENTS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
 
+// editor of the currently editable text block; kept off Block instances to
+// avoid Vue reactivity and serialization. Owner tracked by blockId since
+// undo/redo swaps instances but keeps ids.
+let activeEditor: Editor | null = null;
+let activeEditorBlockId: string | null = null;
+
+// rawStyles were dropped in favour of baseStyles; older blocks still carry them
+const mergeLegacyRawStyles = (baseStyles: BlockStyleMap, rawStyles?: BlockStyleMap) => {
+	if (!rawStyles) return baseStyles;
+	Object.entries(rawStyles).forEach(([style, value]) => {
+		if (value === null || value === "" || value === undefined) return;
+		baseStyles[toStyleProperty(style)] = value;
+	});
+	return baseStyles;
+};
+
+const withoutColor = (style: string) =>
+	style
+		.split(";")
+		.filter((declaration) => declaration.split(":")[0].trim().toLowerCase() !== "color")
+		.join(";")
+		.trim();
+
+// textStyle marks also keep the raw style attribute, which would write the old colour back
+const clearEditorTextColor = (editor: Editor) => {
+	const { from, to } = editor.state.selection;
+	editor
+		.chain()
+		.selectAll()
+		.unsetColor()
+		.setTextSelection({ from, to })
+		.command(({ tr }) => {
+			tr.doc.descendants((node, pos) => {
+				const mark = node.marks.find((m) => m.type.name === "textStyle" && m.attrs.style);
+				if (!mark) return;
+				const style = withoutColor(mark.attrs.style) || null;
+				tr.addMark(pos, pos + node.nodeSize, mark.type.create({ ...mark.attrs, style }));
+			});
+			return true;
+		})
+		.run();
+};
+
 class Block implements BlockOptions {
 	blockId: string;
 	children: Array<Block>;
 	baseStyles: BlockStyleMap;
-	rawStyles: BlockStyleMap;
 	mobileStyles: BlockStyleMap;
 	tabletStyles: BlockStyleMap;
 	attributes: BlockAttributeMap;
@@ -165,8 +213,9 @@ class Block implements BlockOptions {
 			return getBlockInstance(child);
 		});
 
-		this.baseStyles = reactive(options.styles || options.baseStyles || {});
-		this.rawStyles = reactive(options.rawStyles || {});
+		this.baseStyles = reactive(
+			mergeLegacyRawStyles({ ...(options.styles || options.baseStyles || {}) }, options.rawStyles),
+		);
 		this.customAttributes = reactive(options.customAttributes || {});
 		this.mobileStyles = reactive(options.mobileStyles || {});
 		this.tabletStyles = reactive(options.tabletStyles || {});
@@ -193,8 +242,8 @@ class Block implements BlockOptions {
 		parseAndSetBackground(this.tabletStyles);
 
 		if (this.isImage()) {
-			handleBase64Attribute(this, "src", "image.png");
-			handleBase64Attribute(this, "darkSrc", "image-dark.png");
+			handleBase64Attribute(this, "src", "image");
+			handleBase64Attribute(this, "darkSrc", "image-dark");
 		}
 
 		const bgImage = this.getStyle("backgroundImage") as string;
@@ -202,7 +251,7 @@ class Block implements BlockOptions {
 			let bgImage = this.getStyle("backgroundImage") as string;
 			const dataURL = bgImage.match(/url\(['"]?(.*?)['"]?\)/)?.[1];
 
-			const file = dataURLtoFile(dataURL as string, "image.png");
+			const file = dataURLtoFile(dataURL as string, dataURLFileName(dataURL as string, "background"));
 
 			if (file) {
 				this.setStyle("backgroundImage", "");
@@ -224,7 +273,6 @@ class Block implements BlockOptions {
 				styleObj = { ...styleObj, ...this.mobileStyles };
 			}
 		}
-		styleObj = { ...styleObj, ...this.rawStyles };
 		// replace variables with values
 		// Object.keys(styleObj).forEach((style) => {
 		// 	const value = styleObj[style];
@@ -294,21 +342,13 @@ class Block implements BlockOptions {
 	hasChildren() {
 		return this.getChildren().length > 0;
 	}
-	getCustomAttributes() {
+	getCustomAttributes(): BlockAttributeMap {
 		let customAttributes = {};
 		if (this.isExtendedFromComponent()) {
 			customAttributes = this.referenceComponent?.customAttributes || {};
 		}
 		customAttributes = { ...customAttributes, ...this.customAttributes };
 		return customAttributes;
-	}
-	getRawStyles() {
-		let rawStyles = {};
-		if (this.isExtendedFromComponent()) {
-			rawStyles = this.referenceComponent?.rawStyles || {};
-		}
-		rawStyles = { ...rawStyles, ...this.rawStyles };
-		return rawStyles;
 	}
 	getVisibilityCondition() {
 		let visibilityCondition = this.visibilityCondition;
@@ -361,6 +401,9 @@ class Block implements BlockOptions {
 	isSVG() {
 		return this.getElement() === "svg" || this.getInnerHTML()?.startsWith("<svg");
 	}
+	isInlineSVG() {
+		return this.isSVG() && Boolean(this.getInnerHTML());
+	}
 	isText() {
 		return TEXT_ELEMENTS.has(this.getElement() as string);
 	}
@@ -390,11 +433,40 @@ class Block implements BlockOptions {
 		}
 		styleObj[style] = value;
 	}
+	setActiveStyle(style: styleProperty, value: StyleValue) {
+		this.setStyle(this.getActiveStyleProperty(style), value);
+	}
+	getActiveStyleValue(style: styleProperty) {
+		const activeStateStyle = this.getActiveStyleProperty(style);
+		const activeValue = activeStateStyle === style ? undefined : this.getStyle(activeStateStyle);
+		return activeValue === null || activeValue === "" || activeValue === undefined
+			? this.getStyle(style)
+			: activeValue;
+	}
+	getActiveStyleProperty(style: styleProperty) {
+		const activeState = this.activeState?.split(":")[0];
+		return (activeState ? `${activeState}:${String(style)}` : style) as styleProperty;
+	}
 	setAttribute(attribute: string, value: string | undefined) {
 		this.attributes[attribute] = value;
 	}
 	removeAttribute(attribute: string) {
 		this.setAttribute(attribute, undefined);
+	}
+	// published pages apply customAttributes over attributes, so an id set in HTML Attributes wins
+	getId() {
+		return this.getCustomAttributes().id || this.getAttribute("id");
+	}
+	setId(id: string | undefined) {
+		// a removed key falls back to the component's id, so an instance blanks it instead
+		const value = id || (this.referenceComponent?.getId() ? "" : undefined);
+		if (value !== undefined && "id" in this.getCustomAttributes()) {
+			this.customAttributes.id = value;
+		} else {
+			// clearing drops both copies, or the one left behind becomes the id again
+			delete this.customAttributes.id;
+		}
+		this.setAttribute("id", value);
 	}
 	getAttribute(attribute: string) {
 		return this.getAttributes()[attribute];
@@ -431,7 +503,7 @@ class Block implements BlockOptions {
 		return styleValue ?? this.getComponentStyleFallback(style, currentBreakpoint, nativeOnly, cascading);
 	}
 
-	private getStyleMapForBreakpoint(breakpoint: string) {
+	getStyleMapForBreakpoint(breakpoint: string) {
 		const styleMap = {
 			mobile: this.mobileStyles,
 			tablet: this.tabletStyles,
@@ -440,7 +512,7 @@ class Block implements BlockOptions {
 		return styleMap[breakpoint as keyof typeof styleMap] || this.baseStyles;
 	}
 
-	private getStyleWithCascading(style: styleProperty, breakpoint: string): StyleValue | undefined {
+	getStyleWithCascading(style: styleProperty, breakpoint: string): StyleValue | undefined {
 		if (this.isExtendedFromComponent()) {
 			const componentValue = this.referenceComponent?.getStyle(style, breakpoint, true, false);
 			if (componentValue) return componentValue;
@@ -460,7 +532,7 @@ class Block implements BlockOptions {
 		return this.getStyle(style, "desktop");
 	}
 
-	private getInheritedStyleValue(style: styleProperty, breakpoint: string): StyleValue | undefined {
+	getInheritedStyleValue(style: styleProperty, breakpoint: string): StyleValue | undefined {
 		switch (breakpoint) {
 			case "mobile":
 				return this.mobileStyles[style] || this.tabletStyles[style] || this.baseStyles[style];
@@ -471,7 +543,7 @@ class Block implements BlockOptions {
 		}
 	}
 
-	private getComponentStyleFallback(
+	getComponentStyleFallback(
 		style: styleProperty,
 		breakpoint: string,
 		nativeOnly: boolean,
@@ -643,6 +715,14 @@ class Block implements BlockOptions {
 	getParentBlock(): Block | null {
 		return this.parentBlock || null;
 	}
+	getAncestorStyle(style: styleProperty, breakpoint?: string): StyleValue | undefined {
+		let parent = this.getParentBlock();
+		while (parent) {
+			const value = parent.getStyle(style, breakpoint);
+			if (value) return value;
+			parent = parent.getParentBlock();
+		}
+	}
 	selectParentBlock() {
 		const parentBlock = this.getParentBlock();
 		if (parentBlock) {
@@ -721,24 +801,27 @@ class Block implements BlockOptions {
 		}
 	}
 	getEditor(): null | Editor {
-		// @ts-ignore
-		return this.__proto__.editor || null;
+		return this.blockId === activeEditorBlockId ? activeEditor : null;
 	}
-	setTextColor(color: string) {
+	setEditor(editor: Editor | null) {
+		activeEditor = editor;
+		activeEditorBlockId = editor ? this.blockId : null;
+	}
+	setTextColor(color: string | null) {
+		this.setStyle("color", color);
 		const editor = this.getEditor();
 		if (this.isText() && editor && editor.isEditable) {
-			editor.chain().setColor(color).run();
-		} else {
-			this.setStyle("color", color);
-			const innerHTMLDOM = new DOMParser().parseFromString(this.innerHTML || "", "text/html");
-			innerHTMLDOM.querySelectorAll("*").forEach((el) => {
-				(el as HTMLElement).style.color = "";
-			});
-			this.innerHTML = innerHTMLDOM.body.innerHTML;
+			clearEditorTextColor(editor);
+			return;
 		}
+		const innerHTMLDOM = new DOMParser().parseFromString(this.innerHTML || "", "text/html");
+		innerHTMLDOM.querySelectorAll("*").forEach((el) => {
+			(el as HTMLElement).style.color = "";
+		});
+		this.innerHTML = innerHTMLDOM.body.innerHTML;
 	}
 	isHTML() {
-		return this.originalElement === "__raw_html__";
+		return this.originalElement === "__raw_html__" || (isHTMLString(this.getInnerHTML()) && !this.isText());
 	}
 	isIframe() {
 		return this.innerHTML?.startsWith("<iframe");
@@ -813,7 +896,7 @@ class Block implements BlockOptions {
 		}
 		return dataKey;
 	}
-	setDataKey(key: keyof BlockDataKey, value: BlockDataKeyType) {
+	setDataKey<K extends keyof BlockDataKey>(key: K, value: BlockDataKey[K] | null) {
 		if (!this.dataKey || !this.dataKey[key]) {
 			this.dataKey = {
 				key: "",
@@ -825,7 +908,7 @@ class Block implements BlockOptions {
 		if (!value && key === "key") {
 			this.dataKey = {};
 		} else {
-			this.dataKey[key] = value;
+			this.dataKey[key] = value ?? undefined;
 		}
 	}
 	getInnerHTML(): string {
@@ -938,7 +1021,7 @@ class Block implements BlockOptions {
 			}
 		};
 
-		const styleObjects = [this.baseStyles, this.mobileStyles, this.tabletStyles, this.rawStyles];
+		const styleObjects = [this.baseStyles, this.mobileStyles, this.tabletStyles];
 		styleObjects.forEach((styleObj) => {
 			if (styleObj) {
 				Object.values(styleObj).forEach(extractVarsFromValue);
@@ -976,12 +1059,11 @@ class Block implements BlockOptions {
 		const blockCopy = getBlockCopy(this);
 		const parentBlock = this.getParentBlock();
 
-		if (blockCopy.getStyle("position") === "absolute") {
-			// shift the block a bit
-			const left = getNumberFromPx(blockCopy.getStyle("left"));
-			const top = getNumberFromPx(blockCopy.getStyle("top"));
-			blockCopy.setStyle("left", `${left + 20}px`);
-			blockCopy.setStyle("top", `${top + 20}px`);
+		if (blockCopy.isMovable()) {
+			// shift the copy a bit along its pins, keeping a % position in %
+			const position = new BlockPosition(blockCopy, null);
+			const shift = { px: 20, percent: 2 };
+			position.apply(position.pins.moveBy(shift, shift, null));
 		}
 
 		let child = null as Block | null;
@@ -997,17 +1079,11 @@ class Block implements BlockOptions {
 			}
 		});
 	}
-	setPadding(padding: string) {
-		setBoxSpacing(this, "padding", padding);
+	setSpacing(type: SpacingType, value: string) {
+		setSpacing(this, type, value);
 	}
-	getPadding(opts?: { nativeOnly?: boolean; cascading?: boolean }) {
-		return getBoxSpacing(this, "padding", opts);
-	}
-	setMargin(margin: string) {
-		setBoxSpacing(this, "margin", margin);
-	}
-	getMargin(opts?: { nativeOnly?: boolean; cascading?: boolean }) {
-		return getBoxSpacing(this, "margin", opts);
+	getSpacing(type: SpacingType, opts?: { nativeOnly?: boolean; cascading?: boolean }) {
+		return getSpacing(this, type, opts);
 	}
 	getDynamicValues() {
 		const dynamicValues = [...this.dynamicValues];

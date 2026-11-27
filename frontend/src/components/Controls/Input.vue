@@ -1,5 +1,5 @@
 <template>
-	<div ref="containerRef" class="group relative w-full" :class="paddingClass">
+	<div ref="containerRef" class="group relative w-full" :class="[paddingClass, { disabled }]">
 		<Select
 			v-if="type === 'select'"
 			:modelValue="data as string"
@@ -13,6 +13,7 @@
 			@paste="triggerUpdate"
 			@cut="triggerUpdate"
 			@focus="handleFocus"
+			@keydown="commitBeforeSave"
 			@input="($event: Event) => emit('input', ($event.target as HTMLInputElement).value)"
 			autocomplete="off"
 			:autofocus="autofocus"
@@ -21,6 +22,9 @@
 			:modelValue="data">
 			<template #prefix v-if="$slots.prefix">
 				<slot name="prefix" />
+			</template>
+			<template #description v-if="$slots.description">
+				<slot name="description" />
 			</template>
 			<template #suffix v-if="hasSuffix">
 				<div class="flex items-center gap-0.5">
@@ -42,20 +46,23 @@
 				</div>
 			</template>
 		</FormControl>
+		<span v-if="hasOverflow" class="input-overflow-fade" :style="fadeStyle" aria-hidden="true" />
 	</div>
 </template>
 <script lang="ts" setup>
 import NumberArrows from "@/components/Controls/NumberArrows.vue";
+import { isCtrlOrCmd } from "@/utils/helpers";
 import { useNumberInput } from "@/utils/useNumberInput";
 import { useDebounceFn, useResizeObserver, useVModel } from "@vueuse/core";
 import { Select } from "frappe-ui";
-import { computed, ref, useAttrs, useSlots } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, useAttrs, useSlots, watch } from "vue";
 
 const props = withDefaults(
 	defineProps<{
 		modelValue?: string | number | boolean | null;
 		type?: string;
 		hideClearButton?: boolean;
+		hideArrows?: boolean;
 		autofocus?: boolean;
 		disabled?: boolean;
 		selectOnFocus?: boolean;
@@ -76,6 +83,8 @@ interface UseNumberInputOptions {
 }
 
 const isStrictNumber = computed(() => {
+	// Controls like grid Columns/Rows bind a plain number, not a string.
+	if (typeof data.value === "number") return Number.isFinite(data.value);
 	if (typeof data.value !== "string") return false;
 
 	return /^\d*\.?\d+(px|%|em|rem)?$/.test(data.value.trim());
@@ -90,12 +99,39 @@ const slots = useSlots();
 
 const containerRef = ref<HTMLElement | null>(null);
 const containerWidth = ref(Infinity);
+
+const hasOverflow = ref(false);
+
+const fadeStyle = ref({ top: "0px", height: "0px" });
+
+const checkOverflow = () => {
+	const container = containerRef.value;
+	const input = container?.querySelector("input");
+	hasOverflow.value = !!input && input.scrollWidth > input.clientWidth;
+	if (!container || !input || !hasOverflow.value) return;
+	// the container also holds the label/description, so size the fade to the input row alone
+	const top = input.getBoundingClientRect().top - container.getBoundingClientRect().top;
+	fadeStyle.value = { top: `${top + 1}px`, height: `${input.offsetHeight - 2}px` };
+};
+
+const checkOverflowAfterRender = () => void nextTick(checkOverflow);
+
 useResizeObserver(containerRef, (entries) => {
 	containerWidth.value = entries[0].contentRect.width;
+	checkOverflowAfterRender();
+});
+
+onMounted(() => {
+	checkOverflowAfterRender();
 });
 
 const canShowArrows = computed(
-	() => !props.disabled && hasNumber.value && isStrictNumber.value && containerWidth.value >= 60,
+	() =>
+		!props.disabled &&
+		!props.hideArrows &&
+		hasNumber.value &&
+		isStrictNumber.value &&
+		containerWidth.value >= 60,
 );
 
 const hasClearButton = computed(
@@ -121,6 +157,8 @@ const { hasNumber, incrementValue, decrementValue } = useNumberInput({
 	getAttrs: () => attrs,
 });
 
+watch([data, paddingClass], checkOverflowAfterRender, { flush: "post" });
+
 const clearValue = () => {
 	data.value = "";
 	emit("update:modelValue", "");
@@ -134,6 +172,14 @@ const triggerUpdate = useDebounceFn(($event: Event) => {
 		emit("update:modelValue", ($event.target as HTMLInputElement).value);
 	}
 }, 100);
+
+// Ctrl/Cmd+S saves before the change event commits the typed value
+const commitBeforeSave = ($event: KeyboardEvent) => {
+	const target = $event.target as HTMLInputElement;
+	if (!isCtrlOrCmd($event) || $event.key.toLowerCase() !== "s") return;
+	if (!target.matches("input:not([type='checkbox']), textarea")) return;
+	if (target.value !== String(data.value ?? "")) emit("update:modelValue", target.value);
+};
 
 const handleFocus = ($event: Event) => {
 	if (props.selectOnFocus && !props.disabled && props.type !== "checkbox") {
@@ -181,5 +227,52 @@ input[type="number"] {
 
 .has-both-suffix:hover :deep(input) {
 	padding-right: 2.8rem !important;
+}
+
+.input-overflow-fade {
+	--fade-color: var(--surface-gray-2);
+
+	pointer-events: none;
+	position: absolute;
+	right: 0px;
+	z-index: 10;
+	width: 1rem;
+	background: linear-gradient(to right, transparent, var(--fade-color) 75%);
+}
+
+.group:hover > .input-overflow-fade {
+	--fade-color: var(--surface-gray-3);
+}
+
+.group:focus-within > .input-overflow-fade {
+	display: none;
+}
+
+.group.disabled > .input-overflow-fade {
+	--fade-color: var(--surface-gray-1);
+}
+
+.cross-only-suffix > .input-overflow-fade {
+	right: 1.8rem;
+}
+
+.arrows-only-suffix > .input-overflow-fade {
+	right: 3px;
+}
+
+.arrows-only-suffix:hover > .input-overflow-fade {
+	right: 1.4rem;
+}
+
+.has-both-suffix > .input-overflow-fade {
+	right: 1.5rem;
+}
+
+.has-both-suffix:hover > .input-overflow-fade {
+	right: 2.8rem;
+}
+
+.group :deep(input + div) {
+	z-index: 20;
 }
 </style>

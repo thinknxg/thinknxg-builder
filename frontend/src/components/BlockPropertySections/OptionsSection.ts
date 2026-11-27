@@ -1,10 +1,17 @@
 import InlineInput from "@/components/Controls/InlineInput.vue";
 import VisibilityInput from "@/components/VisibilityInput.vue";
 import blockController from "@/utils/blockController";
+import { __ } from "@/translation";
 
 const setClasses = (val: string) => {
 	const classes = val.split(",").map((c) => c.trim());
 	blockController.setClasses(classes);
+};
+
+const setID = (val: string) => {
+	// a space would split the id, so #section links could never match it
+	const id = val.trim().replace(/\s+/g, "-");
+	blockController.getFirstSelectedBlock()?.setId(id || undefined);
 };
 
 const optionsSectionProperties = [
@@ -12,7 +19,7 @@ const optionsSectionProperties = [
 		component: InlineInput,
 		getProps: () => {
 			return {
-				label: "Class",
+				label: __("Class"),
 				modelValue: blockController.getClasses().join(", "),
 			};
 		},
@@ -23,12 +30,28 @@ const optionsSectionProperties = [
 		condition: () => !blockController.multipleBlocksSelected(),
 	},
 	{
+		component: InlineInput,
+		getProps: () => {
+			return {
+				label: __("ID"),
+				description: __("Links to #id scroll to this block"),
+				modelValue: blockController.getFirstSelectedBlock()?.getId(),
+			};
+		},
+		searchKeyWords: "ID, Anchor, Section, Element ID, Scroll To",
+		events: {
+			"update:modelValue": (val: string) => setID(val || ""),
+		},
+		condition: () => !blockController.multipleBlocksSelected(),
+	},
+	{
 		component: VisibilityInput,
 		getProps: () => {
 			return {
-				label: "Condition",
+				label: __("Condition"),
 				property: "visibilityCondition",
-				getModelValue: () => (blockController.getKeyValue("visibilityCondition") as BlockVisibilityCondition).key,
+				getModelValue: () =>
+					(blockController.getKeyValue("visibilityCondition") as BlockVisibilityCondition).key,
 				setModelValue: (val: BlockVisibilityCondition) => {
 					blockController.setKeyValue("visibilityCondition", val);
 				},
@@ -43,6 +66,6 @@ const optionsSectionProperties = [
 ];
 
 export default {
-	name: "Options",
+	name: __("Options"),
 	properties: optionsSectionProperties,
 };

@@ -1,4 +1,6 @@
+import json
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import frappe
@@ -7,6 +9,7 @@ from frappe.tests.utils import FrappeTestCase
 from builder.utils import (
 	Block,
 	ColonRule,
+	add_composite_index_to_web_page_view,
 	camel_case_to_kebab_case,
 	clean_data,
 	copy_asset_file,
@@ -14,13 +17,16 @@ from builder.utils import (
 	copy_img_to_asset_folder,
 	escape_single_quotes,
 	execute_script,
+	export_dir_name,
 	extract_components_from_blocks,
 	get_builder_page_preview_file_paths,
 	get_template_assets_folder_path,
 	is_component_used,
 	make_safe_get_request,
+	normalize_legacy_raw_styles,
 	process_block_assets,
 	remove_unsafe_fields,
+	safe_segment,
 	sanitize_style_value,
 	split_styles,
 )
@@ -55,6 +61,30 @@ class TestBuilderUtils(FrappeTestCase):
 
 		for input_str, expected in test_cases.items():
 			self.assertEqual(escape_single_quotes(input_str), expected)
+
+	def test_export_dir_name(self):
+		test_cases = {
+			"Home Page": "home_page",
+			"Nav-Bar": "nav_bar",
+			"about/us": "about_us",
+			"../../etc/passwd": ".._.._etc_passwd",
+			"..\\..\\secrets": ".._.._secrets",
+		}
+
+		for input_str, expected in test_cases.items():
+			self.assertEqual(export_dir_name(input_str), expected)
+
+	def test_export_dir_name_rejects_traversal_segments(self):
+		for name in ("", ".", ".."):
+			with self.assertRaises(frappe.ValidationError):
+				export_dir_name(name)
+
+	def test_safe_segment_keeps_the_name_within_one_directory(self):
+		self.assertEqual(safe_segment("a/b\\c"), "a_b_c")
+
+		for name in ("", ".", ".."):
+			with self.assertRaises(frappe.ValidationError):
+				safe_segment(name)
 
 	def test_preview_file_paths(self):
 		test_page = frappe.get_doc(
@@ -138,6 +168,15 @@ class TestBuilderUtils(FrappeTestCase):
 		execute_script("data.sum = a + b", {"data": data, "a": 2, "b": 2}, "test.py")
 		self.assertEqual(data.sum, 4)
 
+	def test_execute_script_can_translate(self):
+		data = frappe._dict({})
+		execute_script('data.text = _("Supplier")', {"data": data}, "test.py")
+		self.assertEqual(data.text, "Supplier")
+
+		# the sandbox rejects `frappe._`, only the bare name works (#626)
+		with self.assertRaises(Exception):
+			execute_script('data.text = frappe._("Supplier")', {"data": data}, "test.py")
+
 	@patch("builder.utils.is_safe_exec_enabled", return_value=False)
 	@patch("frappe.utils.safe_exec.is_safe_exec_enabled", return_value=False)
 	def test_execute_script_with_enabled_server_script(self, *args):
@@ -187,10 +226,34 @@ class TestBuilderUtils(FrappeTestCase):
 		# Test with local/private IP addresses (should return None)
 		self.assertIsNone(make_safe_get_request("http://127.0.0.1/test"))
 		self.assertIsNone(make_safe_get_request("http://localhost/test"))
+		self.assertIsNone(make_safe_get_request("http://169.254.169.254/latest/meta-data/"))
+		self.assertIsNone(make_safe_get_request("http://0.0.0.0:8000/"))
 
 		# Test with invalid URL
 		with self.assertRaises(Exception):
 			make_safe_get_request("not-a-url")
+
+	def test_make_safe_get_request_decodes_like_make_get_request(self):
+		cases = [
+			({"content-type": "application/json"}, '{"a": 1}', {"a": 1}),
+			({"content-type": "text/plain; charset=utf-8"}, "a=1", {"a": ["1"]}),
+			({"content-type": "text/html"}, "<p>hi</p>", "<p>hi</p>"),
+			({}, "<p>hi</p>", None),
+		]
+		for headers, text, expected in cases:
+			response = SimpleNamespace(
+				headers=headers,
+				text=text,
+				json=lambda text=text: json.loads(text),
+				raise_for_status=lambda: None,
+			)
+			with patch("builder.utils.public_session") as session:
+				session.return_value.get.return_value = response
+				self.assertEqual(make_safe_get_request("https://api.example.com"), expected)
+
+	def test_make_safe_get_request_refuses_a_proxy(self):
+		with self.assertRaises(TypeError):
+			make_safe_get_request("https://api.example.com", proxies={"https": "http://127.0.0.1:8000"})
 
 	def test_split_styles(self):
 		# Test with None
@@ -203,6 +266,23 @@ class TestBuilderUtils(FrappeTestCase):
 
 		self.assertEqual(result["regular"], {"color": "red", "margin": "10px"})
 		self.assertEqual(result["state"], {"hover:color": "blue", "focus:border": "1px solid black"})
+
+	def test_normalize_legacy_raw_styles_merges_into_base_styles(self):
+		blocks = [
+			{
+				"baseStyles": {"color": "red", "hover:color": "green"},
+				"rawStyles": {"color": "blue", "hover:background-color": "black", "flex-shrink": "0"},
+				"children": [{"rawStyles": {"text-overflow": "ellipsis"}}],
+			}
+		]
+
+		normalize_legacy_raw_styles(blocks)
+
+		self.assertEqual(blocks[0]["baseStyles"]["color"], "blue")
+		self.assertEqual(blocks[0]["baseStyles"]["hover:backgroundColor"], "black")
+		self.assertEqual(blocks[0]["baseStyles"]["flexShrink"], "0")
+		self.assertEqual(blocks[0]["children"][0]["baseStyles"]["textOverflow"], "ellipsis")
+		self.assertNotIn("rawStyles", blocks[0])
 
 	def test_copy_assets_from_blocks(self):
 		# Create a temporary directory for testing
@@ -509,3 +589,15 @@ class TestBuilderUtils(FrappeTestCase):
 
 		for input_val, expected in test_cases.items():
 			self.assertEqual(sanitize_style_value(input_val), expected)
+
+	@patch("frappe.db.add_index")
+	@patch("frappe.get_meta", return_value=frappe._dict(is_virtual=0))
+	def test_add_composite_index_to_web_page_view(self, get_meta, add_index):
+		add_composite_index_to_web_page_view()
+		add_index.assert_called_once_with("Web Page View", ["creation", "is_unique", "path"])
+
+	@patch("frappe.db.add_index")
+	@patch("frappe.get_meta", return_value=frappe._dict(is_virtual=1))
+	def test_add_composite_index_skips_virtual_web_page_view(self, get_meta, add_index):
+		add_composite_index_to_web_page_view()
+		add_index.assert_not_called()

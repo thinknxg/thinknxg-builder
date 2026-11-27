@@ -4,7 +4,7 @@
 			<div class="flex h-full w-48 flex-col justify-between gap-1">
 				<div class="flex flex-col gap-1">
 					<draggable
-						v-model="attachedScriptResource.data"
+						v-model="attachedScripts"
 						:item-key="(script: attachedScript) => script.name"
 						handle=".drag-handle"
 						@end="onScriptReorder"
@@ -13,10 +13,10 @@
 							<a
 								href="#"
 								:class="{
-									'text-ink-gray-5': activeScript !== script,
-									'font-medium !text-ink-gray-8': activeScript === script,
+									'text-ink-gray-5': !isActive(script),
+									'font-medium !text-ink-gray-8': isActive(script),
 								}"
-								@click="selectScript(script)"
+								@click="switchToScript(script)"
 								class="group flex h-6 items-center justify-between gap-1 text-sm first-of-type:mt-6 last-of-type:mb-2 hover:text-ink-gray-7">
 								<div class="flex w-[90%] items-center gap-1">
 									<span
@@ -26,13 +26,11 @@
 									<JavaScriptIcon class="shrink-0" v-if="script.script_type === 'JavaScript'" />
 
 									<EditableSpan
+										:key="script.script_name"
 										v-model="script.script_name"
 										:editable="script.editable && !builderStore.readOnlyMode"
-										:onChange="
-											async (newName) => {
-												await updateScriptName(newName, script);
-											}
-										"
+										:onChange="(newName) => renameScript(newName, script)"
+										@blur="script.editable = false"
 										class="w-full truncate">
 										{{ script.script_name }}
 									</EditableSpan>
@@ -40,25 +38,23 @@
 
 								<Dropdown
 									class="script-options"
-									placement="right"
-									v-if="activeScript === script && !builderStore.readOnlyMode"
+									align="end"
+									v-if="isActive(script) && !builderStore.readOnlyMode"
 									:options="[
 										{
-											label: 'Rename',
+											label: __('Rename'),
 											onClick: () => {
 												script.editable = true;
 											},
 											icon: 'lucide-edit',
 										},
 										{
-											label: 'Remove Script',
-											onClick: () => deleteScript(script.name),
+											label: __('Remove Script'),
+											onClick: () => removeScript(script),
 											icon: 'lucide-trash',
 										},
 									]">
-									<template v-slot="{ open }">
-										<Button icon="lucide-more-horizontal" size="sm" variant="ghost" @click="open"></Button>
-									</template>
+									<Button icon="lucide-more-horizontal" size="sm" variant="ghost" @click.stop></Button>
 								</Dropdown>
 							</a>
 						</template>
@@ -74,39 +70,40 @@
 						">
 						<Dropdown
 							:options="[
-								{ label: 'JavaScript', onClick: () => addScript('JavaScript') },
-								{ label: 'CSS', onClick: () => addScript('CSS') },
+								{ label: __('JavaScript'), onClick: () => addScript('JavaScript') },
+								{ label: __('CSS'), onClick: () => addScript('CSS') },
 							]"
 							size="sm"
 							class="[&>div>div>div]:w-full">
 							<template v-slot="{ open }">
-								<Button class="w-full text-xs" @click="open">New Script</Button>
+								<Button class="w-full text-xs" @click="open">{{ __("New Script") }}</Button>
 							</template>
 						</Dropdown>
 
 						<Combobox
 							v-if="clientScriptResource.data && clientScriptResource.data.length > 0"
+							:key="attachPickerKey"
 							:options="clientScriptOptions"
-							placeholder="Attach Script"
-							@update:modelValue="(value: string | null) => value && attachScript(value)">
+							:placeholder="__('Attach Script')"
+							@update:modelValue="onScriptSelected">
 							<template #trigger>
-								<Button class="w-full text-xs">Attach Script</Button>
+								<Button class="w-full text-xs">{{ __("Attach Script") }}</Button>
 							</template>
 						</Combobox>
 					</div>
 				</div>
 
 				<div class="text-xs leading-4 text-ink-gray-6">
-					<b>Note:</b>
-					All client scripts are executed in preview mode and on published pages.
+					<b>{{ __("Note:") }}</b>
+					{{ __("All client scripts are executed in preview mode and on published pages.") }}
 				</div>
 			</div>
 		</div>
 
 		<div
-			class="flex h-[calc(65vh+68px)] w-full items-center justify-center rounded border border-dashed border-outline-gray-2 bg-surface-gray-1 text-base text-ink-gray-6"
+			class="flex h-[calc(min(65vh,100vh-17rem)+68px)] w-full items-center justify-center rounded-4 border border-dashed border-outline-gray-2 bg-surface-gray-1 text-base text-ink-gray-6"
 			v-show="!activeScript">
-			Add Script
+			{{ __("Add Script") }}
 		</div>
 
 		<div v-if="activeScript" class="flex h-full w-full flex-col">
@@ -115,25 +112,39 @@
 				:modelValue="activeScript.script"
 				:label="activeScript.script_name"
 				:type="activeScript.script_type as 'JavaScript' | 'CSS'"
-				class="flex-1"
+				class="flex-1 [&>div]:max-h-[calc(100vh-17rem)]"
 				mode="page"
-				height="65vh"
+				height="min(65vh, 100vh - 17rem)"
 				:readonly="builderStore.readOnlyMode"
 				:autofocus="false"
 				:show-save-button="true"
 				@save="updateScript"
-				:show-line-numbers="true"></CodeEditor>
+				:show-line-numbers="true">
+				<template #label-suffix>
+					<a
+						v-if="!scriptUsageResource.loading"
+						@click="pageListDialog = true"
+						class="ml-1 cursor-pointer text-p-sm text-ink-gray-4 underline">
+						{{ usageMessage }}
+					</a>
+				</template>
+			</CodeEditor>
 		</div>
+		<PageListModal v-model="pageListDialog" :pages="scriptUsedInPages"></PageListModal>
 	</div>
 </template>
 
 <script setup lang="ts">
+import { __ } from "@/translation";
 import EditableSpan from "@/components/EditableSpan.vue";
+import PageListModal from "@/components/Modals/PageListModal.vue";
 import useBuilderStore from "@/stores/builderStore";
 import usePageStore from "@/stores/pageStore";
-import { BuilderClientScript, BuilderPage } from "@/types/doctypes";
-import { Combobox, createListResource, createResource, Dropdown } from "frappe-ui";
-import { useTelemetry } from "frappe-ui/frappe";
+import { BuilderClientScript, BuilderPage, BuilderPageClientScript } from "@/types/doctypes";
+import { promptDiscardScriptEdits, promptScriptConflict, promptSharedScriptSave } from "@/utils/dialogs";
+import { getErrorMessage, getPageUsageMessage } from "@/utils/helpers";
+import { Combobox, createListResource, createResource, Dropdown, type ComboboxOptionValue } from "frappe-ui";
+import { useTelemetry } from "@framework/ui/telemetry";
 import { computed, nextTick, ref, watch } from "vue";
 import { toast } from "frappe-ui";
 import draggable from "vuedraggable";
@@ -148,14 +159,25 @@ const builderStore = useBuilderStore();
 const pageStore = usePageStore();
 
 type attachedScript = {
+	name: string;
+	creation: string;
+	modified: string;
+	owner: string;
+	modified_by: string;
+	script_name: string;
 	script: string;
 	script_type: string;
-	name: string;
-	script_name: string;
+	script_public_url?: string;
+	script_creation: string;
+	script_modified: string;
+	script_owner: string;
+	script_modified_by: string;
 	editable: boolean;
 };
 
 const activeScript = ref<attachedScript | null>(null);
+// rows are matched by name: the list refetches on its own after insert/delete, swapping every object
+const isActive = (script: attachedScript) => activeScript.value?.name === script.name;
 
 const props = defineProps<{
 	page: BuilderPage;
@@ -168,19 +190,91 @@ const attachedScriptResource = createListResource({
 		parent: props.page.name,
 	},
 	fields: [
+		"name",
+		"creation",
+		"modified",
+		"owner",
+		"modified_by",
+		"builder_script.name as script_name",
 		"builder_script.script",
 		"builder_script.script_type",
-		"builder_script.name as script_name",
-		"name",
+		"builder_script.public_url as script_public_url",
+		"builder_script.creation as script_creation",
+		"builder_script.modified as script_modified",
+		"builder_script.owner as script_owner",
+		"builder_script.modified_by as script_modified_by",
 	],
 	orderBy: "`tabBuilder Page Client Script`.idx asc",
 	auto: true,
 	onSuccess: (data: attachedScript[]) => {
+		syncPageStore(data);
+		const pendingName = builderStore.openClientScript;
+		if (pendingName) {
+			builderStore.openClientScript = null;
+			const target = data.find((s: attachedScript) => s.script_name === pendingName);
+			if (target) {
+				selectScript(target);
+				return;
+			}
+		}
 		if (data && data.length > 0 && !activeScript.value) {
 			selectScript(data[0]);
 		}
 	},
 });
+
+const attachedScripts = computed({
+	get: (): attachedScript[] => attachedScriptResource.data ?? [],
+	set: (scripts: attachedScript[]) => {
+		attachedScriptResource.data = scripts;
+	},
+});
+
+// copy/paste and the AI read the page's scripts from the store, so it mirrors this list
+const syncPageStore = (scripts: attachedScript[]) => {
+	const page = pageStore.activePage;
+	// a reply can land after another page opened, and that page may share these scripts
+	if (page?.name !== props.page.name) return;
+	page.client_scripts = scripts.map(toPageRow);
+	pageStore.activePageScripts = scripts.map(toScriptDoc);
+};
+
+const toPageRow = (script: attachedScript, index: number): BuilderPageClientScript => ({
+	name: script.name,
+	creation: script.creation,
+	modified: script.modified,
+	owner: script.owner,
+	modified_by: script.modified_by,
+	parent: props.page.name,
+	parenttype: "Builder Page",
+	parentfield: "client_scripts",
+	idx: index + 1,
+	builder_script: script.script_name,
+});
+
+const toScriptDoc = (script: attachedScript): BuilderClientScript => ({
+	name: script.script_name,
+	creation: script.script_creation,
+	modified: script.script_modified,
+	owner: script.script_owner,
+	modified_by: script.script_modified_by,
+	script: script.script,
+	script_type: script.script_type,
+	public_url: script.script_public_url,
+});
+
+// a reload swaps every row object, so re-point whatever is selected once it lands (the user may
+// have switched meanwhile), following `moved` when the selected script was renamed or copied
+const reloadScripts = async (moved?: { from: string; to: string }) => {
+	await attachedScriptResource.reload();
+	reselectActive(moved);
+};
+
+const reselectActive = (moved?: { from: string; to: string }) => {
+	let name = activeScript.value?.script_name;
+	if (moved && name === moved.from) name = moved.to;
+	activeScript.value = attachedScripts.value.find((s) => s.script_name === name) ?? null;
+};
 
 const clientScriptResource = createListResource({
 	doctype: "Builder Client Script",
@@ -189,169 +283,253 @@ const clientScriptResource = createListResource({
 	auto: true,
 });
 
+const pageListDialog = ref(false);
+
+const usagePageLimit = 100;
+
+const scriptUsageResource = createListResource({
+	doctype: "Builder Page",
+	fields: ["name", "page_title", "route", "preview"],
+	pageLength: usagePageLimit,
+});
+
+const scriptUsedInPages = computed<BuilderPage[]>(() => scriptUsageResource.data ?? []);
+const otherPagesLabel = computed(() => {
+	const count = scriptUsedInPages.value.length;
+	return count === usagePageLimit ? `${usagePageLimit - 1}+` : String(count - 1);
+});
+const usageMessage = computed(() => {
+	const count = scriptUsedInPages.value.length;
+	return count === usagePageLimit
+		? __("used in {0}+ pages", [usagePageLimit - 1])
+		: getPageUsageMessage(count);
+});
+
+const loadUsage = (scriptName: string) => {
+	scriptUsageResource.filters = [["Builder Page Client Script", "builder_script", "=", scriptName]];
+	scriptUsageResource.reload();
+};
+
 const selectScript = (script: attachedScript) => {
 	activeScript.value = script;
+	loadUsage(script.script_name);
 	nextTick(() => {
 		scriptEditor.value?.resetEditor(true);
 	});
 };
 
-const updateScript = (value: string) => {
-	if (!activeScript.value || builderStore.readOnlyMode) return;
+const switchToScript = async (script: attachedScript) => {
+	if (script.name === activeScript.value?.name) return;
+	const current = activeScript.value?.script_name ?? "";
+	if (scriptEditor.value?.isDirty && !(await promptDiscardScriptEdits(current))) return;
+	selectScript(script);
+};
+
+const updateScript = async (value: string) => {
+	const target = activeScript.value;
+	if (!target || builderStore.readOnlyMode) return;
 
 	if (!value || !value.trim()) {
-		toast.warning("Script cannot be empty");
+		toast.warning(__("Script cannot be empty"));
 		return;
 	}
 
-	pageStore.activePageScripts = pageStore.activePageScripts.map((script: BuilderClientScript) => {
-		if (script.name === activeScript.value?.script_name) {
-			script.script = value;
-		}
-		return script;
-	});
-
-	clientScriptResource.setValue
-		.submit({
-			name: activeScript.value.script_name,
-			script: value,
-		})
-		.then(async () => {
-			await attachedScriptResource.reload();
-			attachedScriptResource.data?.forEach((script: attachedScript) => {
-				if (script.script_name === activeScript.value?.script_name) {
-					activeScript.value = script;
-				}
-			});
-			toast.success("Script saved successfully");
-		})
-		.catch((e: { message: string; exc: string }) => {
-			const error_message = e.exc.split("\n").slice(-2)[0];
-			toast.error("Failed to save script", {
-				description: error_message,
-			});
-		});
+	if (scriptUsageResource.list.loading) await scriptUsageResource.list.promise;
+	// usage now describes the current selection, and switching scripts already dropped this edit
+	if (activeScript.value?.script_name !== target.script_name) return;
+	if (scriptUsedInPages.value.length > 1) {
+		const choice = await promptSharedScriptSave(target.script_name, otherPagesLabel.value);
+		if (choice === "copy") return saveScriptAsCopy(target, value);
+		if (choice !== "all") return;
+	}
+	saveScript(target, value);
 };
 
-const addScript = (scriptType: "JavaScript" | "CSS") => {
-	if (builderStore.readOnlyMode) return;
+const saveScript = async (target: attachedScript, value: string, overwrite = false): Promise<void> => {
+	try {
+		await createResource({ url: "builder.api.save_client_script" }).submit({
+			name: target.script_name,
+			script: value,
+			modified: overwrite ? undefined : target.script_modified,
+		});
+	} catch (error) {
+		return onSaveFailed(target, value, error);
+	}
+	await reloadScripts();
+	toast.success(__("Script saved successfully"));
+};
 
-	clientScriptResource.insert
-		.submit({
+const onSaveFailed = async (target: attachedScript, value: string, error: unknown): Promise<void> => {
+	if (!isStaleSave(error)) {
+		toast.error(__("Failed to save script"), { description: getErrorMessage(error) });
+		return;
+	}
+	const choice = await promptScriptConflict(target.script_name);
+	if (choice === "overwrite") return saveScript(target, value, true);
+	if (choice !== "reload") return;
+	await reloadScripts();
+	if (activeScript.value) selectScript(activeScript.value);
+};
+
+const isStaleSave = (error: unknown) =>
+	typeof error === "object" &&
+	error !== null &&
+	"exc_type" in error &&
+	error.exc_type === "TimestampMismatchError";
+
+const saveScriptAsCopy = async (source: attachedScript, value: string) => {
+	const pageName = props.page.name;
+	try {
+		const copyName: string = await createResource({ url: "builder.api.save_client_script_as_copy" }).submit({
+			page_name: pageName,
+			script_name: source.script_name,
+			script: value,
+		});
+		await reloadScripts({ from: source.script_name, to: copyName });
+		if (activeScript.value?.script_name === copyName) loadUsage(copyName);
+		clientScriptResource.reload();
+		toast.success(__("Saved as {0} for this page", [copyName]));
+	} catch (error) {
+		toast.error(__("Failed to save script"), { description: getErrorMessage(error) });
+	}
+};
+
+const addScript = async (scriptType: "JavaScript" | "CSS") => {
+	if (builderStore.readOnlyMode) return;
+	try {
+		// builder_client_script_created is captured in the backend (before_insert)
+		const script: BuilderClientScript = await clientScriptResource.insert.submit({
 			script_type: scriptType,
 			script: scriptType === "JavaScript" ? "// Write your script here\n" : "/* Write your CSS here */\n",
-		})
-		.then((res: BuilderClientScript) => {
-			attachedScriptResource.insert
-				.submit({
-					parent: props.page.name,
-					parenttype: "Builder Page",
-					parentfield: "client_scripts",
-					builder_script: res.name,
-				})
-				.then(async () => {
-					// builder_client_script_created is captured in the backend (before_insert)
-					await attachedScriptResource.reload();
-					attachedScriptResource.data?.forEach((script: attachedScript) => {
-						if (script.script_name === res.name) {
-							selectScript(script);
-						}
-					});
-					pageStore.activePageScripts.push(res);
-				});
 		});
+		await attachToPage(script.name);
+	} catch (error) {
+		toast.error(__("Failed to add script"), { description: getErrorMessage(error) });
+	}
 };
 
-const attachScript = (builder_script_name: string) => {
-	if (builderStore.readOnlyMode) return;
+// the picker keeps its last pick, so picking the same script again later would not fire
+const attachPickerKey = ref(0);
 
-	attachedScriptResource.insert
-		.submit({
-			parent: props.page.name,
-			parenttype: "Builder Page",
-			parentfield: "client_scripts",
-			builder_script: builder_script_name,
-		})
-		.then(async () => {
-			capture("builder_client_script_attached");
-			await attachedScriptResource.reload();
-			attachedScriptResource.data?.forEach((script: attachedScript) => {
-				if (script.script_name === builder_script_name) {
-					selectScript(script);
-				}
-			});
-		});
+const onScriptSelected = (value: ComboboxOptionValue | null | undefined) => {
+	attachPickerKey.value++;
+	if (typeof value === "string" && value) attachScript(value);
 };
 
-const deleteScript = (scriptName: string) => {
+const attachScript = async (scriptName: string) => {
 	if (builderStore.readOnlyMode) return;
+	try {
+		await attachToPage(scriptName);
+		capture("builder_client_script_attached");
+	} catch (error) {
+		toast.error(__("Failed to attach script"), { description: getErrorMessage(error) });
+	}
+};
 
-	activeScript.value = null;
-	attachedScriptResource.delete.submit(scriptName).then(() => {
-		attachedScriptResource.reload();
+const attachToPage = async (scriptName: string) => {
+	await attachedScriptResource.insert.submit({
+		parent: props.page.name,
+		parenttype: "Builder Page",
+		parentfield: "client_scripts",
+		builder_script: scriptName,
 	});
-	pageStore.activePageScripts = pageStore.activePageScripts.filter(
-		(script: BuilderClientScript) => script.name !== scriptName,
-	);
+	await reloadScripts();
+	const attached = attachedScripts.value.find((s) => s.script_name === scriptName);
+	if (attached) await switchToScript(attached);
 };
 
-const updateScriptName = async (newName: string, script: attachedScript) => {
+const removeScript = async (script: attachedScript) => {
+	if (builderStore.readOnlyMode) return;
+	try {
+		await attachedScriptResource.delete.submit(script.name);
+	} catch (error) {
+		toast.error(__("Failed to remove script"), { description: getErrorMessage(error) });
+		return;
+	}
+	await reloadScripts();
+	if (!activeScript.value && attachedScripts.value.length) selectScript(attachedScripts.value[0]);
+};
+
+const renameScript = async (newName: string, script: attachedScript) => {
 	if (!newName || builderStore.readOnlyMode) return;
-	script.editable = false;
-	pageStore.activePageScripts = pageStore.activePageScripts.map((_script: BuilderClientScript) => {
-		if (_script.name === script.name) {
-			script.name = newName;
-		}
-		return script;
+	await createResource({ url: "frappe.client.rename_doc" }).submit({
+		doctype: "Builder Client Script",
+		old_name: script.script_name,
+		new_name: newName,
 	});
-	return createResource({
-		url: "frappe.client.rename_doc",
-	})
-		.submit({
-			doctype: "Builder Client Script",
-			old_name: script?.script_name,
-			new_name: newName,
-		})
-		.then(async () => {
-			attachedScriptResource.data = attachedScriptResource.data.map(
-				(s: { script_name: string; script: string }) => {
-					if (s.script_name === script.script_name) {
-						s.script_name = newName;
-					}
-					return s;
-				},
-			);
-		});
+	await reloadScripts({ from: script.script_name, to: newName });
+	if (activeScript.value?.script_name === newName) loadUsage(newName);
+	clientScriptResource.reload();
 };
 
-const clientScriptOptions = computed(() =>
-	clientScriptResource.data?.map((script: { name: string; script_type: string }) => ({
-		label: `${script.name}.${script.script_type == "JavaScript" ? "js" : script.script_type.toLowerCase()}`,
-		value: script.name,
-	})),
-);
+const clientScriptOptions = computed(() => {
+	const attached = new Set(attachedScripts.value.map((script) => script.script_name));
+	return (clientScriptResource.data ?? [])
+		.filter((script: { name: string }) => !attached.has(script.name))
+		.map((script: { name: string; script_type: string }) => ({
+			label: `${script.name}.${script.script_type == "JavaScript" ? "js" : script.script_type.toLowerCase()}`,
+			value: script.name,
+		}));
+});
 
 const onScriptReorder = () => {
-	if (!attachedScriptResource.data) return;
-
-	const scriptOrder = attachedScriptResource.data.map((script: attachedScript) => script.name);
-
+	syncPageStore(attachedScripts.value);
 	createResource({
 		url: "builder.api.reorder_client_scripts",
 	})
 		.submit({
-			script_order: scriptOrder,
+			script_order: attachedScripts.value.map((script) => script.name),
 		})
 		.then(() => {
-			toast.success("Script order updated");
+			toast.success(__("Script order updated"));
 		})
-		.catch((e: { message: string; exc: string }) => {
-			const error_message = e.exc.split("\n").slice(-2)[0];
-			toast.error("Failed to update script order", {
-				description: error_message,
-			});
+		.catch((error: unknown) => {
+			toast.error(__("Failed to update script order"), { description: getErrorMessage(error) });
+			reloadScripts();
 		});
 };
+
+const selectScriptByName = (name: string) => {
+	const target = attachedScripts.value.find((s) => s.script_name === name);
+	if (target) selectScript(target);
+};
+
+const reloadWhenSaved = ref(false);
+// An AI turn saved script changes on the server. A dirty editor keeps its text, and
+// saving it then meets the newer version as a conflict instead of losing either; the
+// editor moves to the reloaded row once that text is saved or discarded.
+const reloadAfterAITurn = async () => {
+	reloadWhenSaved.value = false;
+	await attachedScriptResource.reload();
+	// typing may have started while the list loaded: keep the row being edited
+	if (scriptEditor.value?.isDirty) reloadWhenSaved.value = true;
+	else reselectActive();
+};
+
+watch(
+	() => pageStore.scriptsVersion,
+	() => {
+		if (scriptEditor.value?.isDirty) reloadWhenSaved.value = true;
+		else reloadAfterAITurn();
+	},
+);
+
+watch(
+	() => scriptEditor.value?.isDirty,
+	(dirty) => {
+		if (!dirty && reloadWhenSaved.value) reloadAfterAITurn();
+	},
+);
+
+// Handle openClientScript when data is already loaded (component already mounted)
+watch(
+	() => builderStore.openClientScript,
+	(name) => {
+		if (!name || !attachedScriptResource.data?.length) return;
+		builderStore.openClientScript = null;
+		selectScriptByName(name);
+	},
+);
 
 watch(
 	() => props.page,
@@ -365,7 +543,7 @@ watch(
 	},
 );
 
-defineExpose({ scriptEditor });
+defineExpose({ scriptEditor, selectScriptByName });
 </script>
 
 <style scoped>

@@ -1,3 +1,3 @@
-# Frappe Builder
+# thinkNXG Builder
 
 An easier way to build web pages for your needs!

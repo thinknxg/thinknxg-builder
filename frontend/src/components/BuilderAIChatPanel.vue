@@ -1,0 +1,1239 @@
+<template>
+	<div class="flex h-full min-h-full flex-col bg-surface-base">
+		<!-- fixed height, so a title arriving later doesn't push the chat down -->
+		<div class="flex h-14 shrink-0 items-center justify-between border-b border-outline-gray-1 px-3">
+			<div class="flex min-w-0 flex-col gap-1">
+				<div class="text-sm font-semibold text-ink-gray-9">Bob AI</div>
+				<div v-if="isSubmitting || currentSessionTitle" class="truncate text-p-xs leading-4 text-ink-gray-5">
+					{{ isSubmitting ? currentActivity : currentSessionTitle }}
+				</div>
+			</div>
+			<div v-if="builderStore.isAIEnabled" class="flex shrink-0 items-center gap-1">
+				<Button
+					variant="ghost"
+					size="sm"
+					icon="lucide-plus"
+					tooltip="New chat"
+					:disabled="isSubmitting"
+					@click="newSession" />
+				<Dropdown v-if="sessionOptions.length" :options="sessionOptions" :offset="6">
+					<Button
+						variant="ghost"
+						size="sm"
+						icon="lucide-history"
+						tooltip="Chats on this page"
+						:disabled="isSubmitting" />
+				</Dropdown>
+			</div>
+		</div>
+
+		<!-- one element spans both waits (setup verdict + session load) so the
+		     shimmer never blinks; the delayed fade keeps fast loads flash-free -->
+		<div
+			v-if="!builderStore.isAIStateKnown || (isLoadingSession && !messages.length)"
+			class="flex flex-1 items-center justify-center pb-40">
+			<span class="bob-pill-in" style="animation-delay: 300ms">
+				<span class="animate-shine text-p-xs">Loading</span>
+			</span>
+		</div>
+
+		<!-- pb offsets the centring so it sits in the upper third: dead centre of a
+		     full-height panel leaves it stranded low with nothing beneath it. -->
+		<div
+			v-else-if="!builderStore.isAIEnabled"
+			class="flex flex-1 flex-col items-center justify-center gap-4 p-6 pb-40">
+			<span class="bob-hero-orb">
+				<BobOrb class="bob-orb-aura" />
+				<SparklesIcon class="bob-orb-spark relative z-10 size-7 text-ink-gray-8" />
+			</span>
+			<div class="flex flex-col items-center gap-1 text-center">
+				<p class="text-sm font-medium text-ink-gray-8">Build pages by describing them</p>
+				<p class="text-p-xs text-ink-gray-5">Sign in with ChatGPT, or paste an API key.</p>
+			</div>
+			<Button variant="solid" size="sm" @click="menu.open(connectLevel(bob))">Connect a model</Button>
+		</div>
+
+		<template v-else>
+			<!-- overflow-wrap is inherited, so this reaches every message and card. `anywhere`, not
+			     break-words: break-words keeps a flex item as wide as its longest word, so a
+			     pasted URL ran off the panel. -->
+			<div
+				ref="messageContainer"
+				class="no-scrollbar flex-1 space-y-4 overflow-y-auto px-4 py-4 [overflow-wrap:anywhere]">
+				<div v-if="!messages.length" class="flex h-full flex-col items-center justify-center gap-5 px-4 pb-8">
+					<div class="flex flex-col items-center gap-2.5">
+						<span class="bob-hero-orb">
+							<BobOrb class="bob-orb-aura" />
+							<SparklesIcon class="bob-orb-spark relative z-10 size-7 text-ink-gray-8" />
+						</span>
+						<p class="text-sm font-medium text-ink-gray-8">
+							{{ pageHasContent ? "What should we change?" : "Tell me what you're building" }}
+						</p>
+						<p class="text-p-xs text-ink-gray-5">Try one of these, or type your own below</p>
+					</div>
+					<div class="flex w-full flex-col gap-2">
+						<Button
+							v-for="(suggestion, i) in promptSuggestions"
+							:key="suggestion.label"
+							class="bob-pill-in"
+							:style="{ animationDelay: `${i * 70}ms` }"
+							variant="subtle"
+							size="xs"
+							@click="useSuggestion(suggestion)">
+							{{ suggestion.label }}
+						</Button>
+					</div>
+				</div>
+				<div
+					v-for="message in visibleMessages"
+					:key="message.id"
+					class="flex flex-col"
+					:class="message.role === 'user' ? 'items-end' : 'items-start'">
+					<div
+						class="w-fit text-p-sm text-ink-gray-8"
+						:class="
+							message.role === 'user'
+								? 'max-w-[88%] rounded-5 border px-3 py-2 shadow-sm'
+								: 'w-full max-w-full'
+						">
+						<!-- ui-card messages persist the full card as text (for model replay);
+						     the bubble shows only the short lead-in — the card renders the rest -->
+						<AIPageBuild
+							v-if="message.role === 'assistant' && message.metadata?.buildPage"
+							:page="message.metadata.buildPage"
+							:steps="message.metadata.steps || []"
+							:text="message.metadata?.status === 'running' ? '' : message.content"
+							:running="turnRunning(message)"
+							:elapsed-ms="message.metadata.debug?.elapsedMs"
+							:debug="!!message.metadata.debug"
+							@open="chat.openPage"
+							@inspect="openDebug(message.metadata.debug)" />
+						<template v-else-if="message.role === 'assistant'">
+							<!-- What Bob thought, ran and said on the way to this answer. Steps
+							     carry their own running state; the row below covers the stretches
+							     where no step is on the clock. -->
+							<AITurnTimeline
+								v-if="message.metadata?.steps?.length"
+								:steps="message.metadata.steps"
+								:working="stillWorking(message) && !assistantText(message)"
+								class="mb-2" />
+							<div
+								v-if="assistantText(message)"
+								class="ai-prose prose prose-sm max-w-none text-p-sm"
+								v-html="renderMarkdown(assistantText(message))" />
+							<div v-if="cardPlugins(message).length" class="mt-2 flex flex-col gap-2">
+								<AIPluginCard v-for="plugin in cardPlugins(message)" :key="plugin" :plugin="plugin" />
+							</div>
+							<!-- Turn running, nothing on the clock. Between rounds the shimmer is
+							     the timeline's own tail row (same geometry as the steps, so the
+							     next step replaces it in place, no layout shift); this standalone
+							     line covers only what the timeline can't — the answer already
+							     streaming (it sits below the reply as the turn's status, never the
+							     reply shimmering while it's read) or no steps yet. -->
+							<!-- mt-1 only under a streamed reply: standing alone it must sit exactly
+							     where the timeline's first row lands, or the label jumps 4px the
+							     moment "Working" becomes "Thinking". -->
+							<div
+								v-if="stillWorking(message) && (!!assistantText(message) || !message.metadata?.steps?.length)"
+								class="animate-shine w-fit text-p-xs text-ink-gray-5"
+								:class="assistantText(message) && 'mt-1'">
+								Working
+							</div>
+						</template>
+						<div v-else>
+							<!-- Card-composed replies relay a long labelled text to the model;
+							     the chat shows only the compact display line. -->
+							<div class="whitespace-pre-wrap">
+								<template
+									v-for="(part, i) in linkParts(message.metadata?.displayText || message.content)"
+									:key="i">
+									<a
+										v-if="part.href"
+										:href="part.href"
+										target="_blank"
+										rel="noopener noreferrer"
+										class="ai-link">
+										{{ part.text }}
+									</a>
+									<template v-else>{{ part.text }}</template>
+								</template>
+							</div>
+						</div>
+						<div
+							v-if="
+								!message.metadata?.buildPage &&
+								(message.metadata?.affectedBlocks?.length ||
+									message.metadata?.affectedScripts?.length ||
+									message.metadata?.revertSnapshot ||
+									message.metadata?.debug)
+							"
+							class="mb-2 mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-ink-gray-4">
+							<AIAffectedItems
+								v-if="message.metadata?.affectedBlocks?.length || message.metadata?.affectedScripts?.length"
+								:affected-blocks="message.metadata.affectedBlocks || []"
+								:affected-scripts="message.metadata.affectedScripts || []"
+								@select-block="selectBlockById"
+								@open-script="openScriptByName" />
+
+							<Tooltip v-if="canRevert(message)" text="Revert the page to before this AI edit">
+								<button
+									class="inline-flex items-center gap-1 transition-colors hover:text-ink-gray-7 disabled:cursor-not-allowed disabled:opacity-40"
+									:disabled="isSubmitting || !isEditingPage"
+									@click="revertTurn(message)">
+									<span class="lucide-rotate-ccw size-3" />
+									Revert
+								</button>
+							</Tooltip>
+							<!-- Time taken + debugger trigger (full breakdown lives in the debug panel) -->
+							<template v-if="message.metadata?.debug">
+								<div class="ml-auto flex items-center gap-2">
+									<span v-if="message.metadata.debug.elapsedMs">
+										took {{ formatDuration(message.metadata.debug.elapsedMs) }}
+									</span>
+									<Tooltip text="Inspect this turn (rounds, tools, tokens, why it stopped)">
+										<button
+											class="inline-flex items-center transition-colors"
+											:class="
+												debugHasSignal(message.metadata.debug)
+													? 'text-ink-amber-8 hover:text-ink-amber-7'
+													: 'text-ink-gray-4 hover:text-ink-gray-7'
+											"
+											@click="openDebug(message.metadata.debug)">
+											<span class="lucide-activity size-2.5" />
+										</button>
+									</Tooltip>
+								</div>
+							</template>
+						</div>
+						<!-- Bob's changes to other pages: asks per page, then shows how each went -->
+						<AIPageCard
+							v-if="message.metadata?.kind === 'page_changes'"
+							:metadata="message.metadata"
+							:interactive="message.id === lastMessageId"
+							:builds="builds"
+							:busy="isSubmitting"
+							:confirming="confirmingAction"
+							class="mt-2"
+							@apply="(skip) => confirmPendingAction(message, 'apply', skip)"
+							@skip="confirmPendingAction(message, 'skip')"
+							@open="chat.openPage" />
+						<!-- A sensitive action waits for the user's OK. The question is the whole
+						     card (the model-facing summary is suppressed above), so it reads as a
+						     decision, not an alarm. -->
+						<div
+							v-else-if="message.metadata?.status === 'pending_action'"
+							class="mt-2 w-full rounded-6 border border-outline-gray-2 bg-surface-gray-1 p-3">
+							<p class="text-p-sm font-medium text-ink-gray-8">
+								{{ pendingPreview(message.metadata) }}
+							</p>
+							<div v-if="message.id === lastMessageId" class="mt-2.5 flex gap-2">
+								<Button
+									variant="solid"
+									size="sm"
+									:loading="confirmingAction"
+									:disabled="isSubmitting"
+									@click="confirmPendingAction(message, 'apply')">
+									{{ applyLabel(message.metadata) }}
+								</Button>
+								<Button
+									variant="subtle"
+									size="sm"
+									:disabled="confirmingAction || isSubmitting"
+									@click="confirmPendingAction(message, 'skip')">
+									Skip
+								</Button>
+							</div>
+						</div>
+						<!-- Agent-composed UI card (present_ui) -->
+						<AIUISpec
+							v-if="message.metadata?.status === 'ui' && message.metadata?.ui?.length"
+							:ui="message.metadata.ui"
+							:interactive="message.id === lastMessageId"
+							:disabled="isSubmitting || !isEditingPage"
+							:answered-with="replyTo(message)"
+							:lead="message.metadata.text"
+							@submit="selectOption" />
+						<!-- What Bob could do next: tapping one sends it. Plain buttons like the chips
+						     below, since a frappe-ui Button truncates its label to one line. -->
+						<div v-if="nextSteps(message).length" class="mt-2 flex flex-wrap gap-1.5">
+							<button
+								v-for="(step, i) in nextSteps(message)"
+								:key="step"
+								class="bob-pill-in max-w-full rounded-3 bg-surface-gray-2 px-1.5 py-1 text-left text-xs leading-snug text-ink-gray-8 transition-colors hover:bg-surface-gray-3 disabled:cursor-not-allowed disabled:opacity-50"
+								:style="{ animationDelay: `${i * 70}ms` }"
+								:disabled="!isEditingPage"
+								@click="selectOption(step)">
+								{{ step }}
+							</button>
+						</div>
+					</div>
+					<!-- Page, block and attachment chips below the bubble -->
+					<div
+						v-if="
+							message.role === 'user' &&
+							(sentFrom(message) ||
+								message.metadata?.selectedBlockContext?.length ||
+								sentAttachmentChips(message.metadata).length)
+						"
+						class="mt-1 flex max-w-[88%] flex-wrap items-center gap-1">
+						<!-- sent from another page: the chat went on from there -->
+						<button
+							v-if="sentFrom(message)"
+							class="inline-flex items-center gap-1 rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-[10px] text-ink-gray-6 transition-colors hover:bg-surface-gray-3 hover:text-ink-gray-8"
+							@click="chat.openPage(sentFrom(message)!.page_id)">
+							<span class="lucide-file size-2.5" />
+							{{ sentFrom(message)!.title }}
+						</button>
+						<span
+							v-for="chip in sentAttachmentChips(message.metadata)"
+							:key="chip.key"
+							class="inline-flex items-center gap-1 rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-[10px] text-ink-gray-6">
+							<img :src="chip.thumb" class="h-3 w-3 rounded-4 object-cover" alt="" />
+							{{ chip.kind === "video" ? "Video" : "Image" }}
+						</span>
+						<!-- block chips -->
+						<button
+							v-for="block in getVisibleChips(message)"
+							:key="block.id"
+							class="inline-flex items-center rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-[10px] text-ink-gray-6 transition-colors hover:bg-surface-gray-3 hover:text-ink-gray-8"
+							@click="selectBlockById(block.id)">
+							{{ block.label }}
+						</button>
+						<button
+							v-if="(message.metadata?.selectedBlockContext?.length ?? 0) > MAX_VISIBLE_CHIPS"
+							class="inline-flex items-center rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-[10px] text-ink-gray-5 transition-colors hover:bg-surface-gray-3"
+							@click="toggleChips(message.id)">
+							{{
+								expandedMessages.has(message.id)
+									? "Show less"
+									: `+${(message.metadata?.selectedBlockContext?.length ?? 0) - MAX_VISIBLE_CHIPS} more`
+							}}
+						</button>
+					</div>
+				</div>
+			</div>
+		</template>
+		<div v-if="builderStore.isAIStateKnown" class="p-3">
+			<!-- Canvas selection alone sends nothing; attaching is the explicit act
+				     that scopes the request. -->
+			<div
+				v-if="attachedBlocks.length || attachableBlocks.length"
+				class="mb-2 flex flex-wrap items-center gap-1.5">
+				<span v-if="attachedBlocks.length" class="text-xs text-ink-gray-5">Context:</span>
+				<span
+					v-for="block in attachedBlocks"
+					:key="block.id"
+					class="inline-flex items-center gap-1 rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-xs text-ink-gray-7">
+					<span class="lucide-square-dashed h-3 w-3 shrink-0 text-ink-gray-5" />
+					<span class="block max-w-[8rem] truncate">{{ block.label }}</span>
+					<Tooltip text="Remove from context">
+						<button
+							type="button"
+							class="ml-0.5 flex items-center text-ink-gray-4 hover:text-ink-red-7"
+							@click="chat.detachBlock(block.id)">
+							<span class="lucide-x h-3 w-3" />
+						</button>
+					</Tooltip>
+				</span>
+				<button
+					v-if="attachableBlocks.length"
+					type="button"
+					class="inline-flex items-center gap-1 rounded-4 border border-dashed border-outline-gray-2 px-1.5 py-0.5 text-xs text-ink-gray-5 hover:border-outline-gray-3 hover:text-ink-gray-7"
+					@click="chat.attachSelection()">
+					<span class="lucide-plus h-3 w-3" />
+					<span class="block max-w-[10rem] truncate">
+						{{
+							attachableBlocks.length === 1
+								? attachableBlocks[0].getBlockDescription()
+								: `${attachableBlocks.length} selected blocks`
+						}}
+					</span>
+				</button>
+			</div>
+			<Transition name="fade">
+				<div v-if="attachedItems.length" class="mb-1.5 flex flex-wrap gap-1">
+					<span
+						v-for="item in attachedItems"
+						:key="item.id"
+						class="inline-flex items-center gap-1 rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-xs text-ink-gray-7">
+						<span v-if="!item.images.length" class="lucide-loader-circle h-3 w-3 animate-spin" />
+						<img v-else :src="item.images[0].data" class="h-3 w-3 rounded-4 object-cover" alt="" />
+						<span v-if="item.kind === 'video'" class="lucide-film h-3 w-3 text-ink-gray-5" />
+						<span class="max-w-[120px] truncate">{{ item.name }}</span>
+						<Tooltip :text="item.kind === 'video' ? 'Remove video' : 'Remove image'">
+							<button
+								type="button"
+								class="ml-0.5 flex items-center text-ink-gray-4 hover:text-ink-red-7"
+								@click="chat.attachments.remove(item.id)">
+								<span class="lucide-x h-3 w-3" />
+							</button>
+						</Tooltip>
+					</span>
+				</div>
+			</Transition>
+			<div
+				v-for="(note, i) in queuedNotes"
+				:key="i"
+				class="mb-2 flex items-center gap-2 rounded-5 bg-surface-gray-2 px-2.5 py-1.5 text-p-xs text-ink-gray-6">
+				<span class="lucide-clock size-3.5 shrink-0" />
+				<span class="flex-1 truncate">{{ note }}</span>
+				<span class="shrink-0 text-ink-gray-4">Bob reads this next</span>
+				<Tooltip v-if="i === queuedNotes.length - 1">
+					<template #content>
+						<span class="flex items-center gap-1.5">
+							Stop the step Bob is on and read this now
+							<KeyboardShortcut combo="Mod+Enter" class="!text-xs !text-ink-gray-4" />
+						</span>
+					</template>
+					<button class="shrink-0 font-medium underline underline-offset-2" @click="sendNotesNow">
+						Send now
+					</button>
+				</Tooltip>
+			</div>
+			<!-- Say it before a prompt is typed, not after the send fails on the server. -->
+			<div
+				v-if="selectedModelUnusable"
+				class="mb-2 flex items-center gap-2 rounded-5 bg-surface-amber-1 px-2.5 py-1.5 text-p-xs text-ink-amber-7">
+				<span class="lucide-key-round size-3.5 shrink-0" />
+				<span class="flex-1">{{ modelLabel }} has no API key.</span>
+				<button
+					class="shrink-0 font-medium underline underline-offset-2"
+					@click="menu.open(providersLevel(bob))">
+					Add one
+				</button>
+			</div>
+			<div
+				v-else-if="!isEditingPage"
+				class="mb-2 flex items-center gap-2 rounded-5 bg-surface-gray-2 px-2.5 py-1.5 text-p-xs text-ink-gray-6">
+				<span class="lucide-box size-3.5 shrink-0" />
+				<span class="flex-1">Bob only edits the page.</span>
+				<button
+					class="shrink-0 font-medium underline underline-offset-2"
+					@click="canvasStore.exitFragmentMode()">
+					Back to page
+				</button>
+			</div>
+			<!-- one box: the field on top, its controls along the bottom edge -->
+			<div
+				ref="composer"
+				class="relative rounded-6 border border-outline-gray-2 bg-surface-base transition-colors focus-within:border-outline-gray-4 focus-within:shadow-sm hover:border-outline-gray-3 hover:shadow-sm"
+				@paste.stop="handlePaste"
+				@dragover.prevent="isDragging = isVisionModel ? true : isDragging"
+				@dragleave="isDragging = false"
+				@drop.prevent="handleDrop">
+				<!-- grows with the prompt (see autoGrow) up to max-h, then scrolls -->
+				<Textarea
+					ref="promptInput"
+					v-model="prompt"
+					variant="ghost"
+					size="md"
+					:rows="1"
+					class="no-scrollbar max-h-60 min-h-14 resize-none placeholder-ink-gray-4 disabled:border-0 disabled:bg-transparent"
+					:disabled="!isEditingPage"
+					:placeholder="composerPlaceholder"
+					@keydown="menu.onKeydown"
+					@keydown.enter.exact="onEnter"
+					@keydown.enter.ctrl.exact="onSendNow"
+					@keydown.enter.meta.exact="onSendNow"
+					@keydown.up.exact="onArrow"
+					@keydown.down.exact="onArrow" />
+				<div class="flex items-center gap-0.5 p-1.5">
+					<Button
+						variant="ghost"
+						icon="lucide-plus"
+						label="Attach images or a video"
+						:tooltip="isVisionModel ? 'Attach images or a video' : `${modelLabel} can't read images`"
+						:disabled="!isVisionModel || !isEditingPage"
+						@click="imageInput?.click()" />
+					<input
+						ref="imageInput"
+						type="file"
+						accept="image/*,video/*"
+						multiple
+						class="hidden"
+						@change="pickFiles" />
+					<Button
+						variant="ghost"
+						size="xs"
+						icon-right="lucide-chevron-down"
+						:label="modelLabel"
+						class="min-w-0 !shrink"
+						@click="menu.open(modelLevel(bob))" />
+					<Button
+						variant="ghost"
+						size="xs"
+						:icon="selectedEffort ? undefined : 'lucide-brain'"
+						:icon-left="selectedEffort ? 'lucide-brain' : undefined"
+						:label="selectedEffort ? effortLabel(selectedEffort) : undefined"
+						tooltip="Thinking effort"
+						class="shrink-0"
+						@click="menu.open(effortLevel(bob))" />
+					<Tooltip v-if="credits" :text="credits.spent === null ? '' : `${money(credits.spent)} spent`">
+						<Badge variant="subtle" :theme="creditsTheme(credits)" :label="creditsLabel(credits)" />
+					</Tooltip>
+					<span class="flex-1" />
+					<AIContextMeter v-if="contextUsage" :usage="contextUsage" />
+					<Button
+						v-if="isSubmitting"
+						variant="solid"
+						:loading="isCancelling"
+						:tooltip="isCancelling ? 'Cancelling…' : 'Cancel generation'"
+						@click="chat.cancel">
+						<template #icon>
+							<span class="block h-2 w-2 rounded-[1.5px] bg-current" />
+						</template>
+					</Button>
+					<Tooltip v-else side="top">
+						<template #content>
+							<span class="flex items-center gap-1.5">
+								Send
+								<KeyboardShortcut combo="Enter" class="!text-xs !text-ink-gray-4" />
+							</span>
+						</template>
+						<Button variant="solid" icon="lucide-arrow-up" :disabled="!canSubmit" @click="submitPrompt" />
+					</Tooltip>
+				</div>
+				<AICommandMenu v-if="menuOpen" :menu="menu" />
+				<Transition name="fade">
+					<div
+						v-if="isDragging"
+						class="pointer-events-none absolute inset-0 flex items-center justify-center rounded-6 border-2 border-dashed border-outline-blue-3 bg-surface-blue-1/60">
+						<div class="flex items-center gap-1.5 text-xs font-medium text-ink-blue-4">
+							<span class="lucide-image h-3.5 w-3.5" />
+							{{ __("Drop images or a video to attach") }}
+						</div>
+					</div>
+				</Transition>
+			</div>
+		</div>
+		<Dialog title="Turn debug" size="3xl" v-model="debugOpen">
+			<template #default>
+				<AIDebugPanel :debug="debugData" />
+			</template>
+		</Dialog>
+	</div>
+</template>
+
+<script setup lang="ts">
+import AIAffectedItems from "@/components/AIAffectedItems.vue";
+import AIPageBuild from "@/components/ai/AIPageBuild.vue";
+import AIPageCard from "@/components/ai/AIPageCard.vue";
+import AIPluginCard from "@/components/ai/AIPluginCard.vue";
+import AICommandMenu from "@/components/ai/AICommandMenu.vue";
+import AIContextMeter from "@/components/ai/AIContextMeter.vue";
+import AITurnTimeline from "@/components/ai/AITurnTimeline.vue";
+import { sentAttachmentChips } from "@/components/ai/attachments";
+import { registerBobCommands } from "@/components/ai/bobCommands";
+import { useCommandMenu } from "@/components/ai/commandMenu";
+import { connectLevel } from "@/components/ai/commands/connect";
+import { effortLabel, effortLevel } from "@/components/ai/commands/effort";
+import { modelLevel } from "@/components/ai/commands/models";
+import { caretAtEdge, usePromptHistory } from "@/components/ai/promptHistory";
+import { providersLevel } from "@/components/ai/commands/providers";
+import { type BobContext, creditsLabel, creditsTheme, money } from "@/components/ai/commands/shared";
+import AIUISpec from "@/components/ai/AIUISpec.vue";
+import BobOrb from "@/components/ai/BobOrb.vue";
+import { AIChatController } from "@/components/AIChatController";
+import { useAIStatePoll } from "@/composables/useAIStatePoll";
+import AIDebugPanel from "@/components/AIDebugPanel.vue";
+import Dialog from "@/components/Controls/Dialog.vue";
+import SparklesIcon from "@/components/Icons/Sparkles.vue";
+import { cardAnswers } from "@/components/ai/cardAnswers";
+import { linkParts, renderMarkdown } from "@/components/ai/markdown";
+import { pageBuilds } from "@/components/ai/pageChanges";
+import type { AITurnStep, ChatMessage } from "@/components/ai/types";
+import { reloadAIRegistry } from "@/data/aiModels";
+import { __ } from "@/translation";
+import useBuilderStore from "@/stores/builderStore";
+import useCanvasStore from "@/stores/canvasStore";
+import { Badge, Button, Dropdown, KeyboardShortcut, Textarea, Tooltip, useKeyboardShortcut } from "frappe-ui";
+import { onClickOutside } from "@vueuse/core";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
+
+const chat = new AIChatController();
+
+const { prompt, isSubmitting, isCancelling, messages, modelLabel, canSubmit, credits } = chat;
+const { selectedEffort, contextUsage, queuedNotes, sentPrompts } = chat;
+const { isEditingPage } = chat;
+const { selectedModelUnusable } = chat;
+const { progressMessage } = chat;
+const currentActivity = computed(() => progressMessage.value || "Thinking…");
+const { revertTurn, selectOption } = chat;
+const { sessions, sessionId, switchSession, newSession, deleteSession, isLoadingSession } = chat;
+
+const currentSessionTitle = computed(() => {
+	// blank until loaded, not "New chat" flipping to the real title
+	if (!sessionId.value || !sessions.value.length) return "";
+	const current = sessions.value.find((s) => s.name === sessionId.value);
+	return current?.title || "New chat";
+});
+
+/** VS Code-style session switcher: this page's chats (current one checked),
+ * plus delete for the current chat. Titles are first prompts, so cap them —
+ * the dropdown sizes to its longest label and would sprawl across the canvas. */
+const truncateTitle = (title: string, max = 44) =>
+	title.length > max ? title.slice(0, max - 1).trimEnd() + "…" : title;
+
+const sessionOptions = computed(() => {
+	if (!sessions.value.length) return [];
+	// Delete sits in its own group so it reads as an action on the current chat
+	// rather than a fifth chat to switch to — frappe-ui draws the divider.
+	return [
+		{
+			group: "Chats",
+			hideLabel: true,
+			options: sessions.value.map((s) => ({
+				label: truncateTitle(s.title || "New chat"),
+				icon: s.name === sessionId.value ? "lucide-check" : "lucide-message-circle",
+				onClick: () => switchSession(s.name),
+			})),
+		},
+		{
+			group: "Manage",
+			hideLabel: true,
+			// theme belongs on the item — a group-level one isn't inherited.
+			options: [
+				{
+					label: "Delete current chat",
+					icon: "lucide-trash-2",
+					theme: "red",
+					onClick: deleteSession,
+				},
+			],
+		},
+	];
+});
+const { selectBlockById, openScriptByName } = chat;
+const { attachedBlocks, attachableBlocks } = chat;
+const { isDragging, isVisionModel } = chat;
+const attachedItems = chat.attachments.items;
+
+const confirmingAction = ref(false);
+async function confirmPendingAction(message: ChatMessage, decision: "apply" | "skip", skip: string[] = []) {
+	confirmingAction.value = true;
+	try {
+		await chat.confirmPendingAction(message, decision, skip);
+	} finally {
+		confirmingAction.value = false;
+	}
+}
+
+/** Short human summary of a proposed sensitive action, shown on its confirm card. */
+/** The fields as the user would name them ("Name, Email, Message") — the card
+ * must say what gets stored, not count fields in engineering vocabulary. */
+function fieldNames(fields: any[]): string {
+	return (fields || [])
+		.map((f) => f?.label || f?.fieldname)
+		.filter(Boolean)
+		.join(", ");
+}
+
+function pendingPreview(m: Record<string, any>): string {
+	const p = m.payload || {};
+	const fields = fieldNames(p.fields);
+	switch (m.kind) {
+		case "create_doctype":
+			return `Create “${p.name}” to store this page's data${fields ? ` (${fields})` : ""}.`;
+		case "connect_form":
+			return `Save this form's submissions as “${p.doctype_name}” records${fields ? ` (${fields})` : ""}.`;
+		case "seed_sample_data": {
+			const n = (p.rows || []).length;
+			return `Add ${n} sample ${n === 1 ? "record" : "records"} to “${p.doctype}”.`;
+		}
+		case "global_settings":
+			return `Update site-wide code (${Object.keys(p).join(", ")}). This loads on every page.`;
+		case "home_page":
+			return `Make “/${String(p.route || "").replace(/^\//, "")}” the site's home page.`;
+		default:
+			return "Confirm this change?";
+	}
+}
+
+/** The apply button names the action it performs; a bare "Apply" makes the user
+ * re-read the card to know what they're agreeing to. */
+const APPLY_LABELS: Record<string, string> = {
+	create_doctype: "Create it",
+	connect_form: "Connect form",
+	seed_sample_data: "Add records",
+	home_page: "Set home page",
+	global_settings: "Apply",
+};
+const applyLabel = (m: Record<string, any> = {}) => APPLY_LABELS[m.kind || ""] || "Apply";
+const builderStore = useBuilderStore();
+const canvasStore = useCanvasStore();
+
+const lastMessageId = computed(() => messages.value.at(-1)?.id ?? null);
+const builds = computed(() => pageBuilds(messages.value));
+
+/** The next steps Bob suggested after its latest reply, while nothing is running. */
+function nextSteps(message: ChatMessage): string[] {
+	if (message.id !== lastMessageId.value || isSubmitting.value) return [];
+	return message.metadata?.suggestions ?? [];
+}
+
+/** The answer itself, without the timeline that led to it. A card message persists
+ * its whole card as text so the model sees it on replay — the chat shows only the
+ * lead-in and lets AIUISpec draw the rest. A pending-action message's content is
+ * the model-facing summary, and the card already asks the question in human terms;
+ * rendering both put the same ask on screen twice, once in jargon. */
+function assistantText(message: ChatMessage): string {
+	// a page card's text is for the model; its rows say it for the user
+	if (message.metadata?.status === "pending_action" || message.metadata?.kind === "page_changes") return "";
+	return message.metadata?.status === "ui" ? (message.metadata?.text ?? message.content) : message.content;
+}
+
+/** Whether the turn is running with nothing to show for it. Every step it finishes
+ * (a thought, a tool) states its own time and then goes quiet, so the long stretches
+ * (a tool call whose arguments are still streaming, the wait for the next round)
+ * left the chat looking like it had died mid-turn. */
+function stillWorking(message: ChatMessage): boolean {
+	// Only the turn this tab is running: a turn that died mid-flight is persisted
+	// as "running" too, and on reload that would shimmer forever.
+	if (!isSubmitting.value || message.id !== lastMessageId.value) return false;
+	if (message.metadata?.status !== "running") return false;
+	return !(message.metadata.steps || []).some((step: AITurnStep) => step.status === "running");
+}
+
+/** This tab's turn, still running: a build line moves with it. */
+function turnRunning(message: ChatMessage): boolean {
+	return isSubmitting.value && message.id === lastMessageId.value && message.metadata?.status === "running";
+}
+
+/** A turn's snapshot restores onto its own page, and a chat goes on across pages. */
+function canRevert(message: ChatMessage): boolean {
+	const page = message.metadata?.pageId;
+	return !!message.metadata?.revertSnapshot && (!page || page === chat.pageId.value);
+}
+
+/** The page a message was sent from, when that's not the page open now. */
+function sentFrom(message: ChatMessage): { page_id: string; title: string } | null {
+	const page = message.metadata?.page;
+	return page?.page_id && page.page_id !== chat.pageId.value ? page : null;
+}
+
+/** The reply a card was answered with: the user message right after it. That
+ * message IS the answer (the card submits as an ordinary chat reply), so an
+ * answered card can show what was chosen without storing it twice. */
+function replyTo(message: ChatMessage): string | undefined {
+	const next = messages.value[messages.value.findIndex((m) => m.id === message.id) + 1];
+	return next?.role === "user" ? next.content : undefined;
+}
+
+/** A card that reads back every answer makes the bubble under it a second copy
+ * of itself, so the card is the record and the reply drops out of the chat.
+ * Only when the card actually paired them: a reply it can't show (an action
+ * button, an unlabelled question) is left to speak for itself. */
+const visibleMessages = computed(() =>
+	messages.value.filter((message, i) => {
+		// the outcome of a page card, which the card itself shows
+		if (message.metadata?.card) return false;
+		if (message.role !== "user") return true;
+		const card = messages.value[i - 1]?.metadata;
+		if (card?.status !== "ui" || !card?.ui?.length) return true;
+		return !cardAnswers(card.ui, message.content, card.text).length;
+	}),
+);
+
+// --- Empty-state suggestions -------------------------------------------------
+// Fresh page → describe the site to build; page with content → describe a change.
+// Each pill shows a short `label` but prefills a rich `prompt` — a complete brief
+// (name, vibe, sections, emphasis) so the agent can proceed with the fewest
+// follow-up questions. It's an editable starting point, not a command.
+// A wide, characterful pool sampled 3-at-a-time so the panel feels fresh.
+type Suggestion = { label: string; prompt: string };
+const pageHasContent = computed(() => (canvasStore.activeCanvas?.getRootBlock()?.children?.length ?? 0) > 0);
+const BUILD_POOL: Suggestion[] = [
+	{
+		label: "A wood-fired pizzeria in Goa",
+		prompt:
+			"Build a website for Forno, a wood-fired pizzeria in Anjuna, Goa. Warm, rustic-modern feel with big appetizing food photography and a cozy dark-terracotta palette. Sections: a hero with our story, the menu (wood-fired pizzas, small plates, natural wines), a photo gallery, and a visit section with hours and location.",
+	},
+	{
+		label: "Moody portfolio for a photographer",
+		prompt:
+			"Build a portfolio for Aria Sen, a portrait and editorial photographer. Dark, cinematic, image-first design where the photos dominate. Sections: a full-bleed hero image, a gallery of selected work, a short about/bio, a client list, and a contact/booking section.",
+	},
+	{
+		label: "Waitlist page for an AI app",
+		prompt:
+			"Build a launch and waitlist page for Nimbus, an AI note-taking app. Clean and modern with a confident gradient accent. Sections: a punchy hero with the value prop and an email waitlist form, three key features, a short 'how it works', and social proof.",
+	},
+	{
+		label: "Menu & story for a ramen bar",
+		prompt:
+			"Build a website for Slurp, a ramen bar in Bandra, Mumbai. Bold, appetizing, a little playful. Sections: a hero, the ramen menu with descriptions and prices, our origin story, a gallery, and hours and location.",
+	},
+	{
+		label: "A vintage record store",
+		prompt:
+			"Build a website for Groove Vault, a vintage vinyl record store. Retro, textured, warm analog vibe. Sections: a hero, featured new arrivals, the genres we stock, our story, in-store events, and how to find us.",
+	},
+	{
+		label: "Landing page for a yoga studio",
+		prompt:
+			"Build a landing page for Stillpoint, a boutique yoga studio. Calm, airy, minimal with soft natural tones and gentle motion. Sections: a hero, class types and schedule, the teachers, a membership/pricing section, and a book-a-first-class CTA.",
+	},
+	{
+		label: "A bold skincare brand",
+		prompt:
+			"Build a product site for Lumen, a clean skincare brand. Bold, premium, editorial with big product shots. Sections: a hero, the hero product with ingredients and benefits, results, reviews, and a shop/buy CTA.",
+	},
+	{
+		label: "Personal site for a designer",
+		prompt:
+			"Build a personal site for Maya Rao, a product designer. Confident, minimal, type-driven. Sections: a short intro hero, selected case studies, an about section, and contact links (email, LinkedIn, resume).",
+	},
+	{
+		label: "A craft coffee roaster",
+		prompt:
+			"Build a website for Ember & Oak, a craft coffee roaster. Warm, artisanal, rich browns and texture. Sections: a hero, our roasts with tasting notes, the roasting story, wholesale info, and where to buy or visit.",
+	},
+	{
+		label: "Event page for a design meetup",
+		prompt:
+			"Build an event page for Design Jam, a monthly design meetup in Pune. Energetic, modern, poster-like. Sections: a hero with date, venue and RSVP, the speaker lineup, the schedule, past-event highlights, and sponsors.",
+	},
+];
+const EDIT_POOL: Suggestion[] = [
+	{
+		label: "A panel for images missing alt text",
+		prompt:
+			"Build an editor plugin: a left bar panel that lists every image on this page that has no alt text, with a thumbnail of each. Clicking one selects it on the canvas.",
+	},
+	{
+		label: "Add a testimonials section",
+		prompt:
+			"Add a testimonials section with three or four short customer quotes, each with a name and role, styled to match the rest of the page.",
+	},
+	{
+		label: "Make the hero more dramatic",
+		prompt:
+			"Make the hero more dramatic: a larger headline, stronger contrast, a full-bleed background image or bold color, and a clear primary call-to-action.",
+	},
+	{
+		label: "Switch to a dark theme",
+		prompt:
+			"Rework the whole page in a cohesive dark theme, keeping the layout but adjusting backgrounds, text, and accents for good contrast.",
+	},
+	{
+		label: "Add a pricing section",
+		prompt:
+			"Add a pricing section with three tiers (name, price, feature list, and a CTA button each), styled to match the page.",
+	},
+	{
+		label: "Add scroll animations",
+		prompt:
+			"Add tasteful scroll animations: staggered fade-and-rise reveals on each section as it enters the viewport, subtle and smooth.",
+	},
+	{
+		label: "Tighten the spacing everywhere",
+		prompt:
+			"Tighten the spacing across the page: reduce oversized gaps, align section padding to a consistent rhythm, and improve the vertical flow.",
+	},
+	{
+		label: "Add a sticky header with nav",
+		prompt:
+			"Add a sticky header with the name or logo on the left and nav links to each section on the right, gaining a subtle background on scroll.",
+	},
+	{
+		label: "Make it feel more premium",
+		prompt:
+			"Make the page feel more premium: refine the typography and spacing, add depth with subtle shadows and borders, and elevate the color and imagery treatment.",
+	},
+];
+function sample3(pool: Suggestion[]): Suggestion[] {
+	return [...pool].sort(() => Math.random() - 0.5).slice(0, 3);
+}
+// Picked once per mount (a computed would reshuffle on every reactive read).
+const buildPicks = sample3(BUILD_POOL);
+const editPicks = sample3(EDIT_POOL);
+const promptSuggestions = computed(() => (pageHasContent.value ? editPicks : buildPicks));
+const promptInput = ref<InstanceType<typeof Textarea> | null>(null);
+function useSuggestion(suggestion: Suggestion) {
+	prompt.value = suggestion.prompt;
+	promptInput.value?.focus();
+}
+
+// one card per plugin, on the turn that last changed it: the card shows the plugin as it is now
+const lastPluginMessage = computed(() => {
+	const last = new Map<string, string>();
+	for (const message of messages.value) {
+		for (const plugin of message.metadata?.plugins ?? []) last.set(plugin, message.id);
+	}
+	return last;
+});
+const cardPlugins = (message: ChatMessage): string[] =>
+	(message.metadata?.plugins ?? []).filter(
+		(plugin: string) => lastPluginMessage.value.get(plugin) === message.id,
+	);
+
+// a sentence another panel started for the user, like "Build with Bob" in Plugins; they finish it here
+watch(
+	() => builderStore.aiPromptDraft,
+	(draft) => {
+		if (draft === null) return;
+		builderStore.aiPromptDraft = null;
+		prompt.value = draft;
+		nextTick(() => promptInput.value?.focus());
+	},
+	{ immediate: true },
+);
+
+/** Size the box to its content. Reset to auto first — scrollHeight only ever
+ * grows while an explicit height is set, so without it the box could never
+ * shrink back after the prompt is sent or cleared. The min/max come from the
+ * element's own classes, so the clamp lives in one place. */
+function autoGrow() {
+	const el = promptInput.value?.inputElement;
+	if (!el) return;
+	el.style.height = "auto";
+	el.style.height = `${el.scrollHeight}px`;
+}
+watch(prompt, () => nextTick(autoGrow), { immediate: true });
+
+// --- Turn debugger ---------------------------------------------------------
+const debugOpen = ref(false);
+const debugData = ref<Record<string, any> | null>(null);
+function openDebug(debug: Record<string, any>) {
+	debugData.value = debug;
+	debugOpen.value = true;
+}
+/** True when a turn had something noteworthy (truncation, repair, failures, cap) —
+ * tints the debug trigger so problems are spottable without opening it. */
+function debugHasSignal(debug: Record<string, any>): boolean {
+	if (!debug) return false;
+	return Boolean(
+		(debug.argsRepaired ?? 0) > 0 ||
+			(debug.toolFailures?.length ?? 0) > 0 ||
+			(debug.finishReasons || []).includes("length") ||
+			debug.stopReason === "max_rounds",
+	);
+}
+
+/** Human-readable elapsed time, e.g. 950ms→"1s", 147900ms→"2m 28s". The full
+ * token/round breakdown now lives in the debug panel, so the inline line is just this. */
+function formatDuration(ms: number): string {
+	const secs = Math.round((ms || 0) / 1000);
+	if (secs < 60) return `${secs}s`;
+	const mins = Math.floor(secs / 60);
+	if (mins < 60) return secs % 60 ? `${mins}m ${secs % 60}s` : `${mins}m`;
+	const hrs = Math.floor(mins / 60);
+	return mins % 60 ? `${hrs}h ${mins % 60}m` : `${hrs}h`;
+}
+
+// --- "/" commands ----------------------------------------------------------
+const menu = useCommandMenu(prompt);
+const { isOpen: menuOpen, level: menuLevel } = menu;
+const bob: BobContext = {
+	chat,
+	menu,
+	refreshAI: async () => {
+		await reloadAIRegistry();
+		chat.loadModels();
+		await builderStore.refreshAIState();
+	},
+};
+onUnmounted(registerBobCommands(bob));
+// runs the open level's cleanup, like a sign-in still polling
+onUnmounted(menu.close);
+// the menu sits inside the composer, and the prompt is its filter, so clicks there keep it open
+const composer = ref<HTMLElement | null>(null);
+onClickOutside(composer, menu.dismiss);
+// the composer stops its own Escape, so this only hears one pressed after focus left it
+useKeyboardShortcut({
+	combo: "Escape",
+	description: __("Close Bob's Menu"),
+	group: __("General"),
+	enabled: () => menuOpen.value && builderStore.leftPanelActiveTab === "Chat",
+	handler: (event) => menu.onKeydown(event),
+});
+
+const composerPlaceholder = computed(() => {
+	if (menuLevel.value && !menuLevel.value.input) return "Type to filter";
+	if (isSubmitting.value && queuedNotes.value.length) return "Press ↑ to edit what Bob hasn't read";
+	if (isSubmitting.value) return "Tell Bob something while it works";
+	return "Ask to create or edit this page, or type / for commands";
+});
+
+// a list filters on the prompt, and a field inside the menu hands focus back as it goes;
+// after a click away, focus stays wherever the click put it
+watch(menuLevel, (level) => {
+	if (level?.input) return;
+	if (level || composer.value?.contains(document.activeElement)) nextTick(() => promptInput.value?.focus());
+});
+
+const submitPrompt = () => {
+	// while the menu is open, the prompt is a "/" command or a filter, not a message
+	if (menuOpen.value) return;
+	if (isSubmitting.value) chat.steer();
+	else chat.submitPrompt();
+};
+
+// Enter sends. Shift+Enter is the textarea default (newline), .exact skips it.
+const onEnter = (event: KeyboardEvent) => {
+	if (event.isComposing) return;
+	event.preventDefault();
+	submitPrompt();
+};
+
+const sendNotesNow = () => chat.steer(true);
+
+// Mod+Enter while Bob works sends the draft and every queued note straight away
+const onSendNow = (event: KeyboardEvent) => {
+	if (event.isComposing || event.defaultPrevented) return;
+	event.preventDefault();
+	if (isSubmitting.value) sendNotesNow();
+	else submitPrompt();
+};
+
+const history = usePromptHistory(prompt, () => sentPrompts.value);
+
+// Up first takes back what Bob hasn't read yet, then steps through earlier prompts
+const onArrow = (event: KeyboardEvent) => {
+	const el = event.target;
+	if (event.isComposing || event.defaultPrevented || menuOpen.value) return;
+	if (!(el instanceof HTMLTextAreaElement)) return;
+	const up = event.key === "ArrowUp";
+	if (up && queuedNotes.value.length && caretAtEdge(el, true)) {
+		event.preventDefault();
+		chat.takeBackNotes();
+	} else if (history.step(up, el)) {
+		event.preventDefault();
+	}
+};
+
+const messageContainer = ref<HTMLElement | null>(null);
+watch(
+	messageContainer,
+	(el) => {
+		chat.scroll.container.value = el;
+	},
+	{ immediate: true },
+);
+
+onMounted(() => {
+	chat.mount();
+	// A key on a provider is invisible to the client, so ask the server whether AI
+	// is actually usable rather than inferring it from Builder Settings alone.
+	builderStore.refreshAIState();
+});
+useAIStatePoll(() => builderStore.leftPanelActiveTab === "Chat", builderStore);
+
+// the chat usually loads behind the closed tab, where the scroll can't land
+watch(
+	() => builderStore.leftPanelActiveTab,
+	(tab) => {
+		if (tab === "Chat") chat.scroll.flushPending();
+	},
+);
+
+onUnmounted(() => chat.unmount());
+
+function handlePaste(event: ClipboardEvent) {
+	const files = Array.from(event.clipboardData?.files || []);
+	if (!files.length) return;
+	event.preventDefault();
+	chat.attachFiles(files);
+}
+
+const imageInput = ref<HTMLInputElement | null>(null);
+
+function pickFiles(event: Event) {
+	const input = event.target as HTMLInputElement;
+	chat.attachFiles(Array.from(input.files || []));
+	input.value = "";
+}
+
+function handleDrop(event: DragEvent) {
+	isDragging.value = false;
+	chat.attachFiles(Array.from(event.dataTransfer?.files || []));
+}
+
+const MAX_VISIBLE_CHIPS = 3;
+const expandedMessages = ref(new Set<string>());
+
+function getVisibleChips(message: ChatMessage) {
+	const blocks: { id: string; label: string }[] = message.metadata?.selectedBlockContext || [];
+	if (expandedMessages.value.has(message.id)) return blocks;
+	return blocks.slice(0, MAX_VISIBLE_CHIPS);
+}
+
+function toggleChips(messageId: string) {
+	const next = new Set(expandedMessages.value);
+	if (next.has(messageId)) next.delete(messageId);
+	else next.add(messageId);
+	expandedMessages.value = next;
+}
+</script>
+
+<style>
+.ai-prose {
+	--tw-prose-body: var(--ink-gray-8);
+	--tw-prose-headings: var(--ink-gray-9);
+	--tw-prose-bold: var(--ink-gray-9);
+	--tw-prose-code: var(--ink-gray-8);
+	/* Code blocks: typography's pre defaults are fixed light-theme colors, so on
+	 * the dark panel a route tree rendered as barely-visible dark-on-dark. Pin
+	 * BOTH sides of the pair to theme-adaptive tokens (they flip together). */
+	--tw-prose-pre-code: var(--ink-gray-8);
+	--tw-prose-pre-bg: var(--surface-gray-2);
+	--tw-prose-links: var(--ink-gray-9);
+	--tw-prose-bullets: var(--ink-gray-4);
+	--tw-prose-hr: var(--outline-gray-1);
+	--tw-prose-quotes: var(--ink-gray-6);
+	--tw-prose-quote-borders: var(--outline-gray-2);
+	--tw-prose-th-borders: var(--outline-gray-2);
+	--tw-prose-td-borders: var(--outline-gray-1);
+}
+/* Links read as part of the text: a faint underline that firms up on hover. */
+.ai-link,
+.ai-prose a {
+	color: inherit;
+	font-weight: inherit;
+	text-decoration-line: underline;
+	text-decoration-color: var(--outline-gray-3);
+	text-underline-offset: 2px;
+	overflow-wrap: anywhere;
+	transition: text-decoration-color 0.15s;
+}
+.ai-link:hover,
+.ai-prose a:hover {
+	text-decoration-color: var(--ink-gray-5);
+}
+.ai-prose p:first-child {
+	margin-top: 0;
+}
+.ai-prose p:last-child {
+	margin-bottom: 0;
+}
+.ai-prose code {
+	background: var(--surface-gray-2);
+	border-radius: 0.25rem;
+	padding: 0.1em 0.35em;
+	font-size: 0.8em;
+}
+.ai-prose code::before,
+.ai-prose code::after {
+	content: none;
+}
+.ai-prose pre {
+	background: var(--surface-gray-2) !important;
+	border-radius: 0.375rem;
+}
+/* Tables scroll inside the narrow panel instead of overflowing it. */
+.ai-prose table {
+	display: block;
+	overflow-x: auto;
+}
+@keyframes shine {
+	from {
+		background-position: 200% center;
+	}
+	to {
+		background-position: -200% center;
+	}
+}
+/* The travelling band has to move AWAY from the page, not toward it. On dark
+ * that means brightening to near-white, which reads as a glint. Light mode ran
+ * the same direction — mid-grey darkening to near-black — so the text only got
+ * inkier for a moment and the motion didn't register. There it needs the
+ * opposite: dark text with a pale sheen passing over it. */
+.animate-shine {
+	--shine-base: var(--ink-gray-8);
+	--shine-peak: var(--ink-gray-4);
+	background: linear-gradient(120deg, var(--shine-base) 20%, var(--shine-peak) 50%, var(--shine-base) 80%);
+	background-size: 200% auto;
+	-webkit-background-clip: text;
+	background-clip: text;
+	-webkit-text-fill-color: transparent;
+	animation: shine 2.5s linear infinite;
+}
+[data-theme="dark"] .animate-shine {
+	--shine-base: var(--ink-gray-6);
+	--shine-peak: var(--ink-gray-9);
+}
+
+/* Empty-state hero: BobOrb's shader aurora behind the sparkle, in a breathing bloom. */
+.bob-hero-orb {
+	position: relative;
+	display: grid;
+	place-items: center;
+	width: 76px;
+	height: 76px;
+	isolation: isolate;
+}
+/* Soft outer bloom that gently breathes */
+.bob-hero-orb::after {
+	content: "";
+	position: absolute;
+	inset: 4px;
+	border-radius: 999px;
+	background: radial-gradient(circle, rgb(139 92 246 / 0.28), transparent 70%);
+	filter: blur(7px);
+	z-index: 0;
+	animation: bob-orb-bloom 5s ease-in-out infinite;
+}
+@keyframes bob-orb-bloom {
+	0%,
+	100% {
+		opacity: 0.55;
+		transform: scale(0.9);
+	}
+	50% {
+		opacity: 1;
+		transform: scale(1.08);
+	}
+}
+
+/* The shader canvas, clipped to a soft disc. A light blur melts the pixel grid
+ * into the surrounding bloom so the edge reads as glow, not a hard circle. */
+.bob-orb-aura {
+	position: absolute;
+	inset: -6%;
+	z-index: 1;
+	border-radius: 999px;
+	overflow: hidden;
+	filter: blur(4px) saturate(1.15);
+}
+
+/* The sparkle sits above the aura with a soft glow and a gentle twinkle */
+.bob-orb-spark {
+	filter: drop-shadow(0 0 6px rgb(196 181 253 / 0.7));
+	animation: bob-twinkle 3.4s ease-in-out infinite;
+}
+@keyframes bob-twinkle {
+	0%,
+	100% {
+		opacity: 0.9;
+		transform: scale(1) rotate(0deg);
+	}
+	50% {
+		opacity: 1;
+		transform: scale(1.08) rotate(4deg);
+	}
+}
+
+/* Suggestion pills fade-and-rise in, staggered */
+.bob-pill-in {
+	animation: bob-pill-in 0.4s ease both;
+}
+@keyframes bob-pill-in {
+	from {
+		opacity: 0;
+		transform: translateY(6px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.bob-hero-orb::after,
+	.bob-orb-spark,
+	.bob-pill-in,
+	.animate-shine {
+		animation: none;
+	}
+}
+</style>
